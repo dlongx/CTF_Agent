@@ -17,6 +17,8 @@ type Store struct {
 	tasks map[string]*Task
 }
 
+const containerClosedMessage = "容器已关闭"
+
 func NewStore(root string) (*Store, error) {
 	store := &Store{root: root, tasks: map[string]*Task{}}
 	if err := os.MkdirAll(root, 0o755); err != nil {
@@ -40,7 +42,7 @@ func (s *Store) Load() error {
 		if !entry.IsDir() {
 			continue
 		}
-		task, err := s.readTask(filepath.Join(s.root, entry.Name()))
+		task, err := s.readTask(filepath.Join(s.root, entry.Name()), entry.Name())
 		if err != nil {
 			continue
 		}
@@ -50,6 +52,12 @@ func (s *Store) Load() error {
 }
 
 func (s *Store) Add(task *Task) error {
+	if task == nil {
+		return errors.New("task is nil")
+	}
+	if !isSafeTaskID(task.ID) {
+		return errors.New("invalid task id")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.tasks[task.ID] = task
@@ -57,6 +65,9 @@ func (s *Store) Add(task *Task) error {
 }
 
 func (s *Store) Get(id string) (*Task, bool) {
+	if !isSafeTaskID(id) {
+		return nil, false
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	task, ok := s.tasks[id]
@@ -163,6 +174,20 @@ func (s *Store) MarkFlag(id string, flag string) error {
 	})
 }
 
+func (s *Store) MarkInvalidFlag(id string, message string) error {
+	return s.update(id, func(task *Task) {
+		now := time.Now().UTC()
+		task.Flag = nil
+		task.Status = StatusFailed
+		task.Error = &message
+		task.LastStep = message
+		task.FinishedAt = &now
+		task.ContainerKept = false
+		task.OpenCodeHostPort = ""
+		task.OpenCodeWebURL = ""
+	})
+}
+
 func (s *Store) MarkFailed(id string, message string) error {
 	return s.update(id, func(task *Task) {
 		now := time.Now().UTC()
@@ -191,6 +216,9 @@ func (s *Store) MarkOpenCodeSession(id string, sessionID string, webURL string) 
 }
 
 func (s *Store) SaveWriteup(id string, filename string, content string) error {
+	if !isSafeStoredFilename(filename) {
+		return errors.New("invalid writeup filename")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	task, ok := s.tasks[id]
@@ -206,7 +234,10 @@ func (s *Store) SaveWriteup(id string, filename string, content string) error {
 
 func (s *Store) WriteupPath(id string) (string, string, bool) {
 	task, ok := s.Get(id)
-	if !ok || task.WriteupFileName == "" {
+	if !ok || task.Status != StatusSolved || task.WriteupFileName == "" {
+		return "", "", false
+	}
+	if !isSafeStoredFilename(task.WriteupFileName) {
 		return "", "", false
 	}
 	path := filepath.Join(s.root, id, task.WriteupFileName)
@@ -218,13 +249,17 @@ func (s *Store) WriteupPath(id string) (string, string, bool) {
 
 func (s *Store) MarkContainerClosed(id string) error {
 	return s.update(id, func(task *Task) {
+		now := time.Now().UTC()
 		task.ContainerKept = false
 		task.ContainerName = ""
 		task.OpenCodeHostPort = ""
 		task.OpenCodeWebURL = ""
 		task.OpenCodeSession = ""
-		if task.LastStep == "" {
-			task.LastStep = "容器已关闭"
+		task.LastStep = containerClosedMessage
+		if task.Status == StatusRunning || task.Status == StatusQueued {
+			task.Status = StatusFailed
+			task.Error = stringPtr(containerClosedMessage)
+			task.FinishedAt = &now
 		}
 	})
 }
@@ -234,7 +269,7 @@ func (s *Store) RecoverableIDs() []string {
 	defer s.mu.RUnlock()
 	tasks := make([]*Task, 0)
 	for _, task := range s.tasks {
-		if task.Status == StatusQueued || task.Status == StatusRunning {
+		if task.Status == StatusQueued || (task.Status == StatusRunning && task.ContainerName == "") {
 			tasks = append(tasks, task)
 		}
 	}
@@ -263,7 +298,22 @@ func (s *Store) MarkRecovered(id string) error {
 	})
 }
 
+func (s *Store) MarkInterruptedContainerRetained(id string) error {
+	return s.update(id, func(task *Task) {
+		now := time.Now().UTC()
+		msg := "service restarted while task was running; container retained for manual inspection"
+		task.Status = StatusFailed
+		task.Error = &msg
+		task.LastStep = msg
+		task.FinishedAt = &now
+		task.ContainerKept = true
+	})
+}
+
 func (s *Store) update(id string, fn func(*Task)) error {
+	if !isSafeTaskID(id) {
+		return errors.New("invalid task id")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	task, ok := s.tasks[id]
@@ -275,6 +325,12 @@ func (s *Store) update(id string, fn func(*Task)) error {
 }
 
 func (s *Store) writeTask(task *Task) error {
+	if task == nil {
+		return errors.New("task is nil")
+	}
+	if !isSafeTaskID(task.ID) {
+		return errors.New("invalid task id")
+	}
 	if err := os.MkdirAll(filepath.Join(s.root, task.ID), 0o755); err != nil {
 		return err
 	}
@@ -285,7 +341,7 @@ func (s *Store) writeTask(task *Task) error {
 	return os.WriteFile(filepath.Join(s.root, task.ID, "meta.json"), data, 0o644)
 }
 
-func (s *Store) readTask(dir string) (*Task, error) {
+func (s *Store) readTask(dir string, dirID string) (*Task, error) {
 	data, err := os.ReadFile(filepath.Join(dir, "meta.json"))
 	if err != nil {
 		return nil, err
@@ -296,6 +352,9 @@ func (s *Store) readTask(dir string) (*Task, error) {
 	}
 	if task.ID == "" {
 		return nil, errors.New("missing task id")
+	}
+	if !isSafeTaskID(task.ID) || task.ID != dirID {
+		return nil, errors.New("invalid task id")
 	}
 	if task.AttachmentsDir == "" {
 		task.AttachmentsDir = filepath.Join(dir, "attachments")
@@ -333,4 +392,43 @@ func strconvItoa(value int) string {
 		buf[i], buf[j] = buf[j], buf[i]
 	}
 	return string(buf)
+}
+
+func stringPtr(value string) *string {
+	return &value
+}
+
+func isSafeTaskID(id string) bool {
+	if id == "" || id != strings.TrimSpace(id) || id == "." || id == ".." {
+		return false
+	}
+	if filepath.Base(id) != id || strings.ContainsAny(id, `/\`) {
+		return false
+	}
+	for _, char := range id {
+		if char >= 'a' && char <= 'z' {
+			continue
+		}
+		if char >= 'A' && char <= 'Z' {
+			continue
+		}
+		if char >= '0' && char <= '9' {
+			continue
+		}
+		if char == '-' || char == '_' || char == '.' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func isSafeStoredFilename(name string) bool {
+	if name == "" || name != strings.TrimSpace(name) || name == "." || name == ".." {
+		return false
+	}
+	if filepath.IsAbs(name) || filepath.Base(name) != name || strings.ContainsAny(name, `/\`) {
+		return false
+	}
+	return true
 }

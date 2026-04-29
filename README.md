@@ -6,7 +6,7 @@
 
 - Go后端:兼容REST API和WebSocket日志流，支持任务队列、并发Worker、任务恢复和文件持久化。
 - Gin+HTML前端:任务提交、题目卡片列表、单题大屏、按需读取logs.txt和实时跟随。
-- Docker调度:按题型选择镜像，限制CPU/内存/进程数，成功出Flag后销毁容器，失败时保留容器供继续解题。
+- Docker调度:按题型选择镜像，限制CPU/内存/进程数，成功出Flag后销毁容器，未解出时保留容器供继续解题。
 - OpenCode执行层:每个任务容器内启动OpenCodeWeb，根据题型生成Prompt并输出解题日志，任务详情页可打开当前OpenCode会话。
 
 ## 目录结构
@@ -192,25 +192,31 @@ CTF_AGENT_MEM_LIMIT=512m
 CTF_AGENT_CPUS=1.0
 CTF_AGENT_MAX_CONTAINERS=4
 CTF_AGENT_PIDS_LIMIT=1024
-CTF_AGENT_TASK_TIMEOUT=240
 CTF_AGENT_DISABLE_NETWORK=false
 CTF_AGENT_AGENT_SCRIPT=runtime/opencode/bridge.py
 CTF_AGENT_SKILLS_DIR=runtime/opencode/skills
-OPENCODE_TIMEOUT_SECONDS=180
-OPENCODE_PROVIDER_ID=ctf
-OPENCODE_PROVIDER_NAME=CTF Model Gateway
-OPENCODE_PROVIDER_NPM=@ai-sdk/openai-compatible
-OPENCODE_BASE_URL=https://your-model-gateway.example/v1
-OPENCODE_API_KEY=your-key
-OPENCODE_MODEL=gpt-5.2
+OPENCODE_PROVIDER_FORMAT=openai-compatible
+OPENCODE_OPENAI_PROVIDER_ID=ctf
+OPENCODE_OPENAI_PROVIDER_NAME=CTF Model Gateway
+OPENCODE_OPENAI_PROVIDER_NPM=@ai-sdk/openai-compatible
+OPENCODE_OPENAI_BASE_URL=https://your-model-gateway.example/v1
+OPENCODE_OPENAI_API_KEY=your-openai-compatible-key
+OPENCODE_OPENAI_MODEL=gpt-5.2
+OPENCODE_ANTHROPIC_PROVIDER_ID=anthropic
+OPENCODE_ANTHROPIC_PROVIDER_NAME=Anthropic
+OPENCODE_ANTHROPIC_PROVIDER_NPM=@ai-sdk/anthropic
+OPENCODE_ANTHROPIC_BASE_URL=https://api.anthropic.com/v1
+OPENCODE_ANTHROPIC_API_KEY=your-anthropic-key
+OPENCODE_ANTHROPIC_MODEL=claude-sonnet-4-5
 OPENCODE_SERVER_PASSWORD=optional-password
 CTF_AGENT_OPENCODE_WEB_ENABLED=true
 CTF_AGENT_OPENCODE_BIND_IP=127.0.0.1
 CTF_AGENT_OPENCODE_PUBLIC_BASE_URL=http://127.0.0.1
 ```
 
-`CTF_AGENT_TASK_TIMEOUT`是Go调度层的外层超时。后端会保证它至少等于
-`OPENCODE_TIMEOUT_SECONDS+60`，避免OpenCode还在生成最终输出时容器被提前终止。
+Go调度层和OpenCode桥接层不再设置解题总时长超时。任务会一直运行到解出Flag、容器内Agent退出，或用户在Docker管理页手动销毁容器。
+
+`ctf-agent-opencode:latest`同时安装`@ai-sdk/openai-compatible`和`@ai-sdk/anthropic`。前端“模型接口格式”只切换当前使用哪一组配置，不接收、不展示API Key；Key仍来自`opencode.env`。切换后只影响新启动或继续运行时新执行的容器，不会改变已经启动的容器。
 
 镜像选择规则：
 
@@ -248,7 +254,7 @@ OpenCodeWeb访问规则：
 
 ```text
 1.后端为每个任务容器动态映射4096端口
-2.任务运行中或失败保留容器时，详情页显示直达当前session的OpenCode会话入口
+2.任务运行中或未解出但保留容器时，详情页显示直达当前session的OpenCode会话入口
 3.本地开发默认只绑定127.0.0.1
 4.服务器部署时按实际域名或IP设置CTF_AGENT_OPENCODE_PUBLIC_BASE_URL
 5.共享服务器建议设置OPENCODE_SERVER_PASSWORD
@@ -285,7 +291,7 @@ CTF_AGENT_SKILL_IDS={题型}
 附件只读挂载到/attachments
 容器CPU、内存和进程数受限
 成功出Flag后自动删除容器
-失败或超时任务容器会保留，用户可继续提示、打开OpenCode会话或手动关闭
+未解出任务容器会保留，用户可继续提示、打开OpenCode会话或在Docker管理页手动销毁
 OpenCodeWeb默认只映射到宿主机127.0.0.1
 ```
 

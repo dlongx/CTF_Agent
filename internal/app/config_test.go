@@ -55,35 +55,31 @@ func TestLoadConfigDefaultsRuntimePaths(t *testing.T) {
 	}
 }
 
-func TestLoadConfigTaskTimeoutFollowsOpenCodeTimeout(t *testing.T) {
-	t.Setenv("OPENCODE_TIMEOUT_SECONDS", "180")
-	t.Setenv("CTF_AGENT_TASK_TIMEOUT", "")
+func TestLoadConfigBuildsOpenCodeProviderProfiles(t *testing.T) {
+	t.Setenv("OPENCODE_PROVIDER_ID", "ctf")
+	t.Setenv("OPENCODE_PROVIDER_NAME", "CTF Gateway")
+	t.Setenv("OPENCODE_PROVIDER_NPM", "@ai-sdk/openai-compatible")
+	t.Setenv("OPENCODE_BASE_URL", "https://gateway.example/v1")
+	t.Setenv("OPENCODE_API_KEY", "openai-key")
+	t.Setenv("OPENCODE_MODEL", "gpt-demo")
+	t.Setenv("OPENCODE_ANTHROPIC_API_KEY", "anthropic-key")
+	t.Setenv("OPENCODE_ANTHROPIC_MODEL", "claude-demo")
+	t.Setenv("OPENCODE_PROVIDER_FORMAT", "anthropic")
 
 	cfg := LoadConfig()
 
-	if cfg.TaskTimeoutSeconds != 240 {
-		t.Fatalf("TaskTimeoutSeconds=%d want 240", cfg.TaskTimeoutSeconds)
+	if cfg.OpenCodeProviderFormat != ProviderFormatAnthropic {
+		t.Fatalf("OpenCodeProviderFormat=%q", cfg.OpenCodeProviderFormat)
 	}
-}
-
-func TestLoadConfigTaskTimeoutClampsShortValue(t *testing.T) {
-	t.Setenv("OPENCODE_TIMEOUT_SECONDS", "180")
-	t.Setenv("CTF_AGENT_TASK_TIMEOUT", "120")
-
-	cfg := LoadConfig()
-
-	if cfg.TaskTimeoutSeconds != 240 {
-		t.Fatalf("TaskTimeoutSeconds=%d want 240", cfg.TaskTimeoutSeconds)
+	if cfg.OpenCodeProviderNPM != "@ai-sdk/anthropic" || cfg.OpenCodeModel != "claude-demo" {
+		t.Fatalf("active provider not anthropic: npm=%q model=%q", cfg.OpenCodeProviderNPM, cfg.OpenCodeModel)
 	}
-}
-
-func TestLoadConfigTaskTimeoutKeepsLongValue(t *testing.T) {
-	t.Setenv("OPENCODE_TIMEOUT_SECONDS", "180")
-	t.Setenv("CTF_AGENT_TASK_TIMEOUT", "420")
-
-	cfg := LoadConfig()
-
-	if cfg.TaskTimeoutSeconds != 420 {
-		t.Fatalf("TaskTimeoutSeconds=%d want 420", cfg.TaskTimeoutSeconds)
+	openAI, ok := cfg.ProviderForFormat(ProviderFormatOpenAICompatible)
+	if !ok || openAI.APIKey != "openai-key" || openAI.Model != "gpt-demo" {
+		t.Fatalf("openai profile=%+v ok=%v", openAI, ok)
+	}
+	anthropic, ok := cfg.ProviderForFormat(ProviderFormatAnthropic)
+	if !ok || anthropic.APIKey != "anthropic-key" || anthropic.Model != "claude-demo" {
+		t.Fatalf("anthropic profile=%+v ok=%v", anthropic, ok)
 	}
 }

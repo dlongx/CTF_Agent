@@ -1,17 +1,36 @@
 const $ = (selector) => document.querySelector(selector);
 let allTasks = [];
+let allContainers = [];
 let cardRefreshTimeout;
 let detailRefreshTimeout;
+let containerRefreshTimeout;
 let taskEventSource;
+let dockerCardsPointerInside = false;
+let pendingContainerRender = false;
+const fastRefreshDelayMs = 50;
+const activeRefreshIntervalMs = 1500;
 
 function statusBadge(status, id = '') {
   const idAttr = id ? ` id="${escapeHTML(id)}"` : '';
-  return `<span${idAttr} class="badge ${status || ''}">${status || '-'}</span>`;
+  return `<span${idAttr} class="badge ${escapeHTML(status || '')}">${escapeHTML(taskStatusText(status))}</span>`;
 }
 
 function fmtTime(value) {
   if (!value) return '-';
   return new Date(value).toLocaleString();
+}
+
+function fmtDuration(startValue, endValue) {
+  if (!startValue) return '-';
+  const start = new Date(startValue).getTime();
+  const end = endValue ? new Date(endValue).getTime() : Date.now();
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return '-';
+  const totalSeconds = Math.floor((end - start) / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  if (hours > 0) return `${hours}小时${minutes}分钟`;
+  if (minutes > 0) return `${minutes}分钟`;
+  return `${Math.max(totalSeconds, 0)}秒`;
 }
 
 function text(value, fallback = '-') {
@@ -37,8 +56,62 @@ async function loadCards() {
     acc[task.status] = (acc[task.status] || 0) + 1;
     return acc;
   }, {});
-  summary.textContent = `总计${allTasks.length}个任务 · running ${counts.running || 0} · queued ${counts.queued || 0} · solved ${counts.solved || 0} · failed ${counts.failed || 0}`;
+  const activeCount = (counts.running || 0) + (counts.queued || 0);
+  summary.textContent = `总计${allTasks.length}个任务 · 正在解题${activeCount} · 已解出${counts.solved || 0} · 未解出${counts.failed || 0}`;
   renderCards();
+}
+
+async function loadProviderSettings() {
+  const select = $('#provider-format');
+  const status = $('#provider-status');
+  if (!select || !status) return;
+  try {
+    const settings = await fetchJSON('/api/settings/provider');
+    select.innerHTML = (settings.options || []).map((option) => `
+      <option value="${escapeHTML(option.format)}" ${option.active ? 'selected' : ''}>
+        ${escapeHTML(option.label)}${option.configured ? '' : '（未配置）'}
+      </option>
+    `).join('');
+    renderProviderStatus(settings);
+  } catch (error) {
+    status.textContent = error.message;
+  }
+}
+
+function renderProviderStatus(settings) {
+  const status = $('#provider-status');
+  if (!status) return;
+  const active = (settings.options || []).find((option) => option.active);
+  if (!active) {
+    status.textContent = '当前没有可用的模型接口配置。';
+    return;
+  }
+  const configuredText = active.configured ? '已配置' : '缺少配置';
+  const keyText = active.api_key_configured ? 'Key已配置' : 'Key未配置';
+  const baseURLText = active.base_url_configured ? 'BaseURL已配置' : 'BaseURL未配置';
+  status.textContent = `${active.label} · ${active.provider_npm} · ${active.model || '未设置模型'} · ${configuredText} · ${baseURLText} · ${keyText}`;
+}
+
+async function updateProviderSettings(event) {
+  const select = event.currentTarget;
+  const status = $('#provider-status');
+  if (!status) return;
+  status.textContent = '正在切换模型接口格式';
+  select.disabled = true;
+  try {
+    const settings = await fetchJSON('/api/settings/provider', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ format: select.value }),
+    });
+    renderProviderStatus(settings);
+    await loadProviderSettings();
+  } catch (error) {
+    status.textContent = error.message;
+    await loadProviderSettings();
+  } finally {
+    select.disabled = false;
+  }
 }
 
 function renderCards() {
@@ -49,34 +122,110 @@ function renderCards() {
     cards.innerHTML = '<p class="muted">没有符合筛选条件的任务。</p>';
     return;
   }
-  cards.innerHTML = tasks.map((task) => `
-    <article class="card">
-      <a class="card-main" href="/tasks/${encodeURIComponent(task.id)}">
-        <div class="card-head">
-          <div>
-            <h3>${escapeHTML(task.name)}</h3>
-            <div class="card-subtitle">${escapeHTML(task.category || '-')} · 附件${task.attachment_count || 0}</div>
+  cards.innerHTML = tasks.map((task) => {
+    const writeupAction = task.status === 'solved' && task.has_writeup
+      ? `<a class="button-link secondary" href="/api/tasks/${encodeURIComponent(task.id)}/writeup">下载WP</a>`
+      : '';
+    return `
+      <article class="card">
+        <a class="card-main" href="/tasks/${encodeURIComponent(task.id)}">
+          <div class="card-head">
+            <div>
+              <h3>${escapeHTML(task.name)}</h3>
+              <div class="card-subtitle">${escapeHTML(task.category || '-')} · 附件${task.attachment_count || 0}</div>
+            </div>
+            ${statusBadge(task.status)}
           </div>
-          ${statusBadge(task.status)}
+          <div class="card-meta">
+            <span>${task.flag ? '已捕获Flag' : '未捕获Flag'}</span>
+            <span>${fmtTime(task.created_at)}</span>
+          </div>
+        </a>
+        <div class="card-actions">
+          ${writeupAction}
+          <button class="secondary copy-flag" data-flag="${escapeHTML(task.flag || '')}" ${task.flag ? '' : 'disabled'}>${task.flag ? '复制Flag' : '暂无Flag'}</button>
         </div>
-        <div class="card-meta">
-          <span>${task.flag ? '已捕获Flag' : '未捕获Flag'}</span>
-          <span>${fmtTime(task.created_at)}</span>
-        </div>
-      </a>
-      <div class="card-actions">
-        <a class="button-link secondary ${task.has_writeup ? '' : 'disabled'}" href="${task.has_writeup ? `/api/tasks/${encodeURIComponent(task.id)}/writeup` : '#'}">${task.has_writeup ? '下载WP' : '暂无WP'}</a>
-        <button class="secondary copy-flag" data-flag="${escapeHTML(task.flag || '')}" ${task.flag ? '' : 'disabled'}>${task.flag ? '复制Flag' : '暂无Flag'}</button>
-        <button class="secondary danger close-container-card" data-task-id="${escapeHTML(task.id)}" ${task.container_kept ? '' : 'hidden'}>关闭容器</button>
-      </div>
-    </article>
-  `).join('');
+      </article>
+    `;
+  }).join('');
   document.querySelectorAll('.copy-flag').forEach((button) => {
     button.addEventListener('click', copyFlag);
   });
+}
+
+async function loadContainers() {
+  const cards = $('#docker-cards');
+  if (!cards) return;
+  const summary = $('#docker-summary');
+  const payload = await fetchJSON('/api/containers');
+  allContainers = payload.containers || [];
+  const counts = allContainers.reduce((acc, item) => {
+    acc[item.container_state] = (acc[item.container_state] || 0) + 1;
+    return acc;
+  }, {});
+  const dockerStatus = payload.docker_available
+    ? `未销毁容器${payload.live_count || 0}个`
+    : `Docker不可用：${payload.docker_error || 'unknown'}`;
+  summary.textContent = `${dockerStatus} · 正在解题${counts.running || 0} · 已停止${(counts.retained || 0) + (counts.exited || 0)}项`;
+  if (dockerCardsPointerInside) {
+    pendingContainerRender = true;
+    return;
+  }
+  renderContainers();
+}
+
+function renderContainers() {
+  const cards = $('#docker-cards');
+  if (!cards) return;
+  if (allContainers.length === 0) {
+    cards.innerHTML = '<p class="muted">当前没有未销毁的ctf-agent任务容器。</p>';
+    return;
+  }
+  cards.innerHTML = allContainers.map((item) => {
+    const stateText = containerStateText(item.container_state);
+    const canClose = item.docker_found;
+    return `
+      <article class="card docker-card">
+        <a class="card-main" href="/tasks/${encodeURIComponent(item.task_id)}">
+          <div class="card-head">
+            <div>
+              <h3>${escapeHTML(item.task_name)}</h3>
+              <div class="card-subtitle">${escapeHTML(item.category || '-')} · ${escapeHTML(item.task_id)}</div>
+            </div>
+            <span class="badge ${escapeHTML(item.container_state)}">${stateText}</span>
+          </div>
+          <div class="docker-status-row">
+            <span>任务:${escapeHTML(taskStatusText(item.task_status))}</span>
+            <span>容器:${stateText}</span>
+            <span>时长:${escapeHTML(fmtDuration(item.started_at, item.finished_at))}</span>
+          </div>
+        </a>
+        <div class="card-actions">
+          <a class="button-link secondary" href="/tasks/${encodeURIComponent(item.task_id)}">查看任务</a>
+          <button class="secondary danger close-container-card" data-task-id="${escapeHTML(item.task_id)}" data-task-name="${escapeHTML(item.task_name)}" ${canClose ? '' : 'disabled'}>销毁容器</button>
+        </div>
+      </article>
+    `;
+  }).join('');
   document.querySelectorAll('.close-container-card').forEach((button) => {
     button.addEventListener('click', closeContainerFromCard);
   });
+}
+
+function containerStateText(state) {
+  if (state === 'running') return '正在解题';
+  if (state === 'retained') return '已停止未销毁';
+  if (state === 'exited') return '已停止未销毁';
+  if (state === 'missing') return 'Docker未找到';
+  return state || '-';
+}
+
+function taskStatusText(status) {
+  if (status === 'queued') return '正在解题';
+  if (status === 'running') return '正在解题';
+  if (status === 'solved') return '已解出';
+  if (status === 'failed') return '未解出';
+  return status || '-';
 }
 
 function filteredTasks() {
@@ -87,7 +236,8 @@ function filteredTasks() {
   return allTasks.filter((task) => {
     if (type && task.category !== type) return false;
     if (status === 'solved' && task.status !== 'solved') return false;
-    if (status === 'unsolved' && task.status === 'solved') return false;
+    if (status === 'active' && !['running', 'queued'].includes(task.status)) return false;
+    if (status === 'unsolved' && task.status !== 'failed') return false;
     if (['running', 'queued', 'failed'].includes(status) && task.status !== status) return false;
     if (date) {
       const created = new Date(task.created_at);
@@ -136,8 +286,7 @@ async function loadTaskDetail() {
   $('#task-attachments').textContent = text(task.attachment_count, '0');
   $('#task-flag').textContent = text(task.flag);
   $('#task-error').textContent = text(task.error);
-  $('#task-last-step').textContent = text(task.last_step);
-  $('#task-writeup').innerHTML = task.has_writeup
+  $('#task-writeup').innerHTML = task.status === 'solved' && task.has_writeup
     ? `<a href="/api/tasks/${encodeURIComponent(task.id)}/writeup">下载${escapeHTML(task.writeup_file_name || 'wp.md')}</a>`
     : '-';
   $('#task-container').textContent = task.container_kept
@@ -154,13 +303,24 @@ async function loadTaskDetail() {
 function updateOpenCodePanel(task) {
   const field = $('#task-opencode');
   const hasEndpoint = Boolean(task.opencode_available && task.opencode_web_url);
-  const hasSession = Boolean(hasEndpoint && task.opencode_session);
+  const safeURL = hasEndpoint ? safeHTTPURL(task.opencode_web_url) : '';
+  const status = task.opencode_status || (hasEndpoint ? 'starting' : 'unavailable');
+  const message = task.opencode_message || '';
+  const hasSession = Boolean(safeURL && task.opencode_session);
   if (field) {
-    field.innerHTML = hasSession
-      ? `<a class="button-link compact" href="${escapeHTML(task.opencode_web_url)}" target="_blank" rel="noopener">打开当前会话</a>`
-      : hasEndpoint
-        ? '等待OpenCode会话初始化'
-      : '不可用';
+    if (status === 'error') {
+      field.innerHTML = `<span class="inline-error">OpenCode服务错误：${escapeHTML(message || '启动失败')}</span>`;
+      return;
+    }
+    if (hasSession) {
+      field.innerHTML = `<a class="button-link compact" href="${escapeHTML(safeURL)}" target="_blank" rel="noopener">打开当前会话</a>`;
+      return;
+    }
+    if (status === 'starting' || safeURL) {
+      field.textContent = message || '等待OpenCode会话初始化';
+      return;
+    }
+    field.textContent = message || '不可用';
   }
 }
 
@@ -206,6 +366,18 @@ function escapeHTML(value) {
   }[char]));
 }
 
+function safeHTTPURL(value) {
+  try {
+    const url = new URL(String(value), window.location.origin);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+      return '';
+    }
+    return url.href;
+  } catch {
+    return '';
+  }
+}
+
 async function copyFlag(event) {
   const button = event.currentTarget;
   const flag = button.dataset.flag || '';
@@ -230,15 +402,21 @@ async function closeContainerFromCard(event) {
   const button = event.currentTarget;
   const taskID = button.dataset.taskId;
   if (!taskID) return;
+  if (!confirmCloseContainer(button.dataset.taskName || taskID)) return;
   button.disabled = true;
-  button.textContent = '关闭中';
+  button.textContent = '销毁中';
   try {
     await fetchJSON(`/api/tasks/${encodeURIComponent(taskID)}/container/close`, { method: 'POST' });
     await loadCards();
+    await loadContainers();
   } catch (error) {
     button.disabled = false;
     button.textContent = error.message;
   }
+}
+
+function confirmCloseContainer(name) {
+  return window.confirm(`确认销毁${name}的容器吗？销毁后只能保留日志、已解出的WP和附件，不能继续这个运行现场。`);
 }
 
 async function sendHint() {
@@ -261,20 +439,6 @@ async function sendHint() {
     input.value = '';
     await loadTaskDetail();
     await followLogs();
-  } catch (error) {
-    status.textContent = error.message;
-  }
-}
-
-async function closeContainerFromDetail() {
-  const shell = $('.detail-shell');
-  const status = $('#hint-status');
-  if (!shell || !status) return;
-  status.textContent = '正在关闭容器';
-  try {
-    await fetchJSON(`/api/tasks/${encodeURIComponent(shell.dataset.taskId)}/container/close`, { method: 'POST' });
-    status.textContent = '容器已关闭';
-    await loadTaskDetail();
   } catch (error) {
     status.textContent = error.message;
   }
@@ -323,7 +487,7 @@ function scheduleCardRefresh() {
   clearTimeout(cardRefreshTimeout);
   cardRefreshTimeout = setTimeout(() => {
     loadCards().catch(() => {});
-  }, 180);
+  }, fastRefreshDelayMs);
 }
 
 function scheduleDetailRefresh(taskID) {
@@ -333,7 +497,45 @@ function scheduleDetailRefresh(taskID) {
   clearTimeout(detailRefreshTimeout);
   detailRefreshTimeout = setTimeout(() => {
     loadTaskDetail().catch(() => {});
-  }, 180);
+  }, fastRefreshDelayMs);
+}
+
+function scheduleContainerRefresh() {
+  if (!$('#docker-cards')) return;
+  clearTimeout(containerRefreshTimeout);
+  containerRefreshTimeout = setTimeout(() => {
+    loadContainers().catch(() => {});
+  }, fastRefreshDelayMs);
+}
+
+function setupDockerCardStability() {
+  const cards = $('#docker-cards');
+  if (!cards) return;
+  cards.addEventListener('mouseenter', () => {
+    dockerCardsPointerInside = true;
+  });
+  cards.addEventListener('mouseleave', () => {
+    dockerCardsPointerInside = false;
+    if (pendingContainerRender) {
+      pendingContainerRender = false;
+      renderContainers();
+    }
+  });
+}
+
+function setupActivePolling() {
+  window.setInterval(() => {
+    if ($('#task-cards') && allTasks.some((task) => task.status === 'running' || task.status === 'queued')) {
+      loadCards().catch(() => {});
+    }
+    if ($('#docker-cards')) {
+      loadContainers().catch(() => {});
+    }
+    const shell = $('.detail-shell');
+    if (shell && shell.dataset.notFound !== 'true') {
+      loadTaskDetail().catch(() => {});
+    }
+  }, activeRefreshIntervalMs);
 }
 
 function setupTaskEvents() {
@@ -349,12 +551,15 @@ function setupTaskEvents() {
     if (payload.type !== 'task_changed') return;
     scheduleCardRefresh();
     scheduleDetailRefresh(payload.task_id);
+    scheduleContainerRefresh();
   });
 }
 
 document.addEventListener('DOMContentLoaded', () => {
   $('#task-form')?.addEventListener('submit', submitTask);
+  $('#provider-format')?.addEventListener('change', updateProviderSettings);
   $('#refresh')?.addEventListener('click', loadCards);
+  $('#docker-refresh')?.addEventListener('click', loadContainers);
   $('#filter-type')?.addEventListener('change', renderCards);
   $('#filter-status')?.addEventListener('change', renderCards);
   $('#filter-date')?.addEventListener('change', renderCards);
@@ -365,9 +570,16 @@ document.addEventListener('DOMContentLoaded', () => {
     if (logs) logs.textContent = '';
   });
   $('#send-hint')?.addEventListener('click', sendHint);
-  $('#close-container')?.addEventListener('click', closeContainerFromDetail);
   loadCards().catch((error) => {
     const cards = $('#task-cards');
+    if (cards) cards.innerHTML = `<p class="muted">${escapeHTML(error.message)}</p>`;
+  });
+  loadProviderSettings().catch((error) => {
+    const status = $('#provider-status');
+    if (status) status.textContent = error.message;
+  });
+  loadContainers().catch((error) => {
+    const cards = $('#docker-cards');
     if (cards) cards.innerHTML = `<p class="muted">${escapeHTML(error.message)}</p>`;
   });
   loadTaskDetail().catch((error) => {
@@ -376,4 +588,6 @@ document.addEventListener('DOMContentLoaded', () => {
   });
   setupTaskEvents();
   setupDropzone();
+  setupDockerCardStability();
+  setupActivePolling();
 });
