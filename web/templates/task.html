@@ -1,0 +1,73 @@
+{{define "task.html"}}
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.title}}</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <main class="shell detail-shell" data-task-id="{{.taskID}}" data-not-found="{{.notFound}}">
+    <header class="topbar">
+      <div>
+        <a class="back-link" href="/">返回任务列表</a>
+        <h1 id="task-title">任务详情</h1>
+      </div>
+      <span id="task-status" class="badge">加载中</span>
+    </header>
+
+    <section class="detail-grid">
+      <aside class="task-info">
+        <dl>
+          <dt>任务ID</dt>
+          <dd id="task-id">{{.taskID}}</dd>
+          <dt>题型</dt>
+          <dd id="task-category">-</dd>
+          <dt>目标IP</dt>
+          <dd id="task-target">-</dd>
+          <dt>附件数量</dt>
+          <dd id="task-attachments">-</dd>
+          <dt>Flag</dt>
+          <dd id="task-flag">-</dd>
+          <dt>错误</dt>
+          <dd id="task-error">-</dd>
+          <dt>当前步骤</dt>
+          <dd id="task-last-step">-</dd>
+          <dt>WP</dt>
+          <dd id="task-writeup">-</dd>
+          <dt>容器</dt>
+          <dd id="task-container">-</dd>
+          <dt>OpenCode</dt>
+          <dd id="task-opencode">-</dd>
+        </dl>
+        <h2>题目描述</h2>
+        <pre id="task-description" class="description-box">加载中</pre>
+        <div class="hint-panel" id="hint-panel" hidden>
+          <h2>继续解题提示</h2>
+          <textarea id="hint-input" rows="4" placeholder="输入新的思路、约束或提示，让保留容器继续尝试"></textarea>
+          <div class="hint-actions">
+            <button id="send-hint">继续解题</button>
+            <button class="secondary danger" id="close-container">关闭容器</button>
+          </div>
+          <p class="muted" id="hint-status"></p>
+        </div>
+      </aside>
+
+      <section class="log-view">
+        <div class="section-head">
+          <h2>日志输出</h2>
+          <div class="toolbar">
+            <button id="load-logs">查看日志</button>
+            <button class="secondary" id="follow-logs">实时跟随</button>
+            <button class="secondary" id="clear-logs">清空显示</button>
+          </div>
+        </div>
+        <pre id="logs" class="terminal">点击“查看日志”后显示logs.txt内容。</pre>
+      </section>
+    </section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>
+{{end}}

@@ -1,0 +1,112 @@
+{{define "index.html"}}
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.title}}</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">AI CTF AGENT</p>
+        <h1>自动化解题调度台</h1>
+      </div>
+      <div class="topbar-actions">
+        <div class="summary" id="summary">加载中</div>
+      </div>
+    </header>
+
+    <div class="workspace-grid">
+      <section class="submit-panel">
+        <div class="section-head compact">
+          <h2>题目工作台</h2>
+        </div>
+        <form id="task-form" enctype="multipart/form-data">
+          <div class="field">
+            <label for="name">题目名称</label>
+            <input id="name" name="name" required placeholder="phase-demo">
+          </div>
+          <div class="field">
+            <label for="type">题型</label>
+            <select id="type" name="type" required>
+              <option value="misc">misc</option>
+              <option value="web">web</option>
+              <option value="pwn">pwn</option>
+              <option value="crypto">crypto</option>
+              <option value="reverse">reverse</option>
+              <option value="forensics">forensics</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="target_ip">目标IP</label>
+            <input id="target_ip" name="target_ip" placeholder="可选">
+          </div>
+          <div class="field wide">
+            <label for="description">题目描述</label>
+            <textarea id="description" name="description" required rows="4">请自动分析题目描述与所有附件，优先枚举文件类型、提取关键信息、根据题型选择合适工具，必要时编写脚本验证推理。找到Flag后输出最终Flag，并用中文总结关键解题步骤。</textarea>
+          </div>
+          <div class="field wide">
+            <label for="attachments">附件</label>
+            <label class="dropzone" id="dropzone" for="attachments">
+              <input id="attachments" name="attachments" type="file" multiple>
+              <span class="dropzone-title">拖入附件或点击选择</span>
+              <span class="dropzone-subtitle" id="file-summary">支持一次提交多个文件</span>
+            </label>
+          </div>
+          <div class="actions">
+            <button type="submit">提交题目</button>
+            <span id="form-status" class="muted"></span>
+          </div>
+        </form>
+      </section>
+
+      <section class="tasks-panel">
+        <div class="section-head">
+          <h2>任务卡片</h2>
+          <button class="secondary" id="refresh">刷新</button>
+        </div>
+        <div class="filters">
+          <div class="field">
+            <label for="filter-type">题目类型</label>
+            <select id="filter-type">
+              <option value="">全部类型</option>
+              <option value="misc">misc</option>
+              <option value="web">web</option>
+              <option value="pwn">pwn</option>
+              <option value="crypto">crypto</option>
+              <option value="reverse">reverse</option>
+              <option value="forensics">forensics</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="filter-status">是否解完</label>
+            <select id="filter-status">
+              <option value="">全部状态</option>
+              <option value="solved">已出Flag</option>
+              <option value="unsolved">未解完</option>
+              <option value="running">解题中</option>
+              <option value="queued">排队中</option>
+              <option value="failed">失败</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="filter-date">日期</label>
+            <select id="filter-date">
+              <option value="">全部日期</option>
+              <option value="today">今天</option>
+              <option value="7d">近7天</option>
+              <option value="30d">近30天</option>
+            </select>
+          </div>
+        </div>
+        <div class="cards" id="task-cards"></div>
+      </section>
+    </div>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>
+{{end}}

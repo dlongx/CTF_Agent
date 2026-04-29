@@ -1,0 +1,853 @@
+package app
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"log"
+	"os"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+)
+
+var openCodeSessionPattern = regexp.MustCompile(`Observation:\s+OpenCode session=([A-Za-z0-9_-]+)`)
+
+type taskEvent struct {
+	Type   string `json:"type"`
+	TaskID string `json:"task_id,omitempty"`
+}
+
+type Service struct {
+	cfg   Config
+	store *Store
+	hub   *Hub
+	queue chan string
+	done  chan struct{}
+	wg    sync.WaitGroup
+}
+
+func NewService(cfg Config) (*Service, error) {
+	if err := os.MkdirAll(cfg.ChallengeDir, 0o755); err != nil {
+		return nil, err
+	}
+	store, err := NewStore(cfg.ChallengeDir)
+	if err != nil {
+		return nil, err
+	}
+	service := &Service{
+		cfg:   cfg,
+		store: store,
+		hub:   NewHub(),
+		queue: make(chan string, max(1, cfg.MaxContainers)*4),
+		done:  make(chan struct{}),
+	}
+	service.repairFinishedTaskFlags()
+	service.repairSparseWriteups()
+	for i := 0; i < max(1, cfg.MaxContainers); i++ {
+		service.wg.Add(1)
+		go service.worker(i)
+	}
+	for _, id := range store.RecoverableIDs() {
+		if err := store.MarkRecovered(id); err != nil {
+			log.Printf("recover task %s: %v", id, err)
+			continue
+		}
+		service.AppendLog(id, "[dispatcher] recovered queued task after service startup\n")
+		service.enqueue(id)
+	}
+	return service, nil
+}
+
+func (s *Service) Close() {
+	close(s.done)
+	s.wg.Wait()
+}
+
+func (s *Service) NewTaskID() string {
+	var buf [16]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return strconvItoa(int(time.Now().UnixNano()))
+	}
+	return hex.EncodeToString(buf[:])
+}
+
+func (s *Service) Submit(task *Task) error {
+	if err := s.store.Add(task); err != nil {
+		return err
+	}
+	s.publishTaskChanged(task.ID)
+	s.enqueue(task.ID)
+	s.AppendLog(task.ID, "[dispatcher] queued workers="+strconvItoa(max(1, s.cfg.MaxContainers))+"\n")
+	return nil
+}
+
+func (s *Service) AppendLog(taskID string, text string) {
+	if err := s.store.AppendLog(taskID, text); err != nil {
+		log.Printf("append log %s: %v", taskID, err)
+		return
+	}
+	if sessionID := extractOpenCodeSessionID(text); sessionID != "" {
+		task, ok := s.store.Get(taskID)
+		if ok {
+			webURL := task.OpenCodeWebURL
+			if task.OpenCodeHostPort != "" {
+				webURL = s.cfg.OpenCodeSessionURL(task.OpenCodeHostPort, sessionID)
+			}
+			if err := s.store.MarkOpenCodeSession(taskID, sessionID, webURL); err != nil {
+				log.Printf("mark opencode session %s: %v", taskID, err)
+			} else {
+				s.publishTaskChanged(taskID)
+			}
+		}
+	}
+	s.hub.Publish(taskID, text)
+}
+
+func (s *Service) publishTaskChanged(taskID string) {
+	payload, err := json.Marshal(taskEvent{Type: "task_changed", TaskID: taskID})
+	if err != nil {
+		return
+	}
+	s.hub.PublishEvent(string(payload))
+}
+
+func (s *Service) enqueue(id string) {
+	select {
+	case s.queue <- id:
+	case <-s.done:
+	}
+}
+
+func extractOpenCodeSessionID(text string) string {
+	match := openCodeSessionPattern.FindStringSubmatch(text)
+	if len(match) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(match[1])
+}
+
+func (s *Service) worker(index int) {
+	defer s.wg.Done()
+	for {
+		select {
+		case <-s.done:
+			return
+		case id := <-s.queue:
+			s.runTask(index, id)
+		}
+	}
+}
+
+func (s *Service) runTask(workerIndex int, taskID string) {
+	task, ok := s.store.Get(taskID)
+	if !ok {
+		return
+	}
+	if err := s.store.MarkRunning(taskID); err != nil {
+		s.AppendLog(taskID, "[dispatcher] failed to mark running: "+err.Error()+"\n")
+		return
+	}
+	s.publishTaskChanged(taskID)
+	s.AppendLog(taskID, "[dispatcher] worker="+strconvItoa(workerIndex)+" picked task="+taskID+"\n")
+
+	result, err := RunDockerTask(
+		s.cfg,
+		task,
+		func(text string) {
+			s.AppendLog(taskID, text)
+		},
+		func(endpoint DockerEndpoint) {
+			if err := s.store.MarkRuntimeEndpoint(
+				taskID,
+				endpoint.ContainerName,
+				endpoint.OpenCodeHostPort,
+				endpoint.OpenCodeWebURL,
+			); err != nil {
+				s.AppendLog(taskID, "[dispatcher] failed to save runtime endpoint: "+err.Error()+"\n")
+			} else {
+				s.publishTaskChanged(taskID)
+			}
+		},
+	)
+	if err != nil {
+		s.AppendLog(taskID, "[dispatcher] task failed before completion: "+err.Error()+"\n")
+		_ = s.store.MarkFailed(taskID, err.Error())
+		s.publishTaskChanged(taskID)
+		s.AppendLog(taskID, "[dispatcher] task status=failed\n")
+		return
+	}
+
+	logs, _ := s.store.Logs(taskID)
+	flag := s.extractFlagForTask(task, logs)
+	lastStep := summarizeLastStep(logs)
+	solved := flag != nil
+	containerKept := result.Retained && !solved
+	if solved && result.ContainerName != "" {
+		if err := CloseTaskContainer(result.ContainerName); err != nil {
+			s.AppendLog(taskID, "[dispatcher] failed to remove solved container: "+err.Error()+"\n")
+			containerKept = true
+		} else {
+			s.AppendLog(taskID, "[runner] removing solved container_name="+result.ContainerName+"\n")
+		}
+	}
+	if err := s.store.MarkFinished(taskID, result.ExitCode, flag, lastStep, result.ContainerName, containerKept); err != nil {
+		s.AppendLog(taskID, "[dispatcher] failed to mark finished: "+err.Error()+"\n")
+		return
+	}
+	s.saveWriteup(taskID)
+	s.publishTaskChanged(taskID)
+	finished, _ := s.store.Get(taskID)
+	s.AppendLog(taskID, "[dispatcher] task status="+string(finished.Status)+"\n")
+}
+
+func (s *Service) ContinueTask(taskID string, hint string) error {
+	task, ok := s.store.Get(taskID)
+	if !ok {
+		return os.ErrNotExist
+	}
+	hint = strings.TrimSpace(hint)
+	if hint == "" {
+		return errors.New("hint is required")
+	}
+	if !task.ContainerKept || task.ContainerName == "" {
+		return errors.New("task has no retained container")
+	}
+	if task.Status == StatusRunning || task.Status == StatusQueued {
+		return errors.New("task is already running")
+	}
+	if err := s.store.MarkRunning(taskID); err != nil {
+		return err
+	}
+	s.publishTaskChanged(taskID)
+	s.AppendLog(taskID, "\n[dispatcher] user hint: "+hint+"\n")
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		current, ok := s.store.Get(taskID)
+		if !ok {
+			return
+		}
+		result, err := RunDockerHint(s.cfg, current, hint, func(text string) {
+			s.AppendLog(taskID, text)
+		})
+		if err != nil {
+			s.AppendLog(taskID, "[dispatcher] continuation failed: "+err.Error()+"\n")
+			_ = s.store.MarkFailed(taskID, err.Error())
+			s.publishTaskChanged(taskID)
+			return
+		}
+		logs, _ := s.store.Logs(taskID)
+		flag := s.extractFlagForTask(current, logs)
+		lastStep := summarizeLastStep(logs)
+		solved := flag != nil
+		containerKept := result.Retained && !solved
+		if solved && result.ContainerName != "" {
+			if err := CloseTaskContainer(result.ContainerName); err != nil {
+				s.AppendLog(taskID, "[dispatcher] failed to remove solved container: "+err.Error()+"\n")
+				containerKept = true
+			} else {
+				s.AppendLog(taskID, "[runner] removing solved container_name="+result.ContainerName+"\n")
+			}
+		}
+		if err := s.store.MarkFinished(taskID, result.ExitCode, flag, lastStep, result.ContainerName, containerKept); err != nil {
+			s.AppendLog(taskID, "[dispatcher] failed to mark continuation finished: "+err.Error()+"\n")
+			return
+		}
+		s.saveWriteup(taskID)
+		s.publishTaskChanged(taskID)
+		finished, _ := s.store.Get(taskID)
+		s.AppendLog(taskID, "[dispatcher] task status="+string(finished.Status)+"\n")
+	}()
+	return nil
+}
+
+func (s *Service) CloseTaskContainer(taskID string) error {
+	task, ok := s.store.Get(taskID)
+	if !ok {
+		return os.ErrNotExist
+	}
+	if task.ContainerName == "" || !task.ContainerKept {
+		return errors.New("task has no retained container")
+	}
+	if err := CloseTaskContainer(task.ContainerName); err != nil {
+		return err
+	}
+	if err := s.store.MarkContainerClosed(taskID); err != nil {
+		return err
+	}
+	s.publishTaskChanged(taskID)
+	s.AppendLog(taskID, "[dispatcher] retained container closed by user\n")
+	return nil
+}
+
+func (s *Service) saveWriteup(taskID string) {
+	task, ok := s.store.Get(taskID)
+	if !ok {
+		return
+	}
+	logs, _ := s.store.Logs(taskID)
+	filename := safeMarkdownFilename(task.Name)
+	content := buildWriteup(task, logs)
+	if err := s.store.SaveWriteup(taskID, filename, content); err != nil {
+		s.AppendLog(taskID, "[dispatcher] failed to write wp: "+err.Error()+"\n")
+		return
+	}
+	s.AppendLog(taskID, "[dispatcher] writeup saved: "+filename+"\n")
+}
+
+func (s *Service) repairSparseWriteups() {
+	for _, task := range s.store.List() {
+		if task.Status == StatusQueued || task.Status == StatusRunning {
+			continue
+		}
+		path, _, ok := s.store.WriteupPath(task.ID)
+		needsRepair := !ok
+		if ok {
+			content, err := os.ReadFile(path)
+			needsRepair = err != nil || writeupNeedsRepair(task, string(content))
+		}
+		if !needsRepair {
+			continue
+		}
+		logs, _ := s.store.Logs(task.ID)
+		if err := s.store.SaveWriteup(task.ID, safeMarkdownFilename(task.Name), buildWriteup(task, logs)); err != nil {
+			log.Printf("repair writeup %s: %v", task.ID, err)
+		}
+	}
+}
+
+func (s *Service) repairFinishedTaskFlags() {
+	for _, task := range s.store.List() {
+		if task.Status == StatusQueued || task.Status == StatusRunning {
+			continue
+		}
+		logs, _ := s.store.Logs(task.ID)
+		flag := s.extractFlagForTask(task, logs)
+		if flag == nil {
+			continue
+		}
+		if task.Flag != nil && *task.Flag == *flag {
+			continue
+		}
+		if err := s.store.MarkFlag(task.ID, *flag); err != nil {
+			log.Printf("repair flag %s: %v", task.ID, err)
+			continue
+		}
+		repaired, ok := s.store.Get(task.ID)
+		if !ok {
+			continue
+		}
+		if err := s.store.SaveWriteup(task.ID, safeMarkdownFilename(repaired.Name), buildWriteup(repaired, logs)); err != nil {
+			log.Printf("repair writeup after flag %s: %v", task.ID, err)
+		}
+	}
+}
+
+func (s *Service) extractFlagForTask(task *Task, logs string) *string {
+	if flag := extractFinalLineFlag(logs); flag != "" {
+		return &flag
+	}
+	return nil
+}
+
+func extractFinalLineFlag(logs string) string {
+	output := extractReadableOutput(logs)
+	for _, line := range reversedLines(output) {
+		if flag := normalizeFinalFlagLine(line); flag != "" {
+			return flag
+		}
+	}
+	return ""
+}
+
+func reversedLines(text string) []string {
+	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	for i, j := 0, len(lines)-1; i < j; i, j = i+1, j-1 {
+		lines[i], lines[j] = lines[j], lines[i]
+	}
+	return lines
+}
+
+func normalizeFinalFlagLine(line string) string {
+	line = strings.TrimSpace(stripANSI(line))
+	line = strings.TrimPrefix(line, "- ")
+	line = strings.TrimPrefix(line, "* ")
+	line = strings.TrimSpace(line)
+	if line == "" || isPlatformLogLine(line) {
+		return ""
+	}
+	if match := regexp.MustCompile("`([^`]+)`").FindAllStringSubmatch(line, -1); len(match) > 0 {
+		line = match[len(match)-1][1]
+	}
+	for _, separator := range []string{"最终 Flag:", "最终Flag:", "Final Flag:", "Flag:", "flag:", "：", ":"} {
+		if index := strings.LastIndex(line, separator); index >= 0 {
+			prefix := strings.TrimSpace(line[:index])
+			if strings.Contains(strings.ToLower(prefix), "flag") || strings.Contains(prefix, "最终") {
+				line = line[index+len(separator):]
+				break
+			}
+		}
+	}
+	line = strings.Trim(strings.TrimSpace(line), "`'\"，。；;")
+	if !isUsableFinalFlag(line) {
+		return ""
+	}
+	return line
+}
+
+func isUsableFinalFlag(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" || len([]rune(value)) > 300 {
+		return false
+	}
+	if strings.ContainsAny(value, " \t\r\n") {
+		return false
+	}
+	if strings.Contains(value, "/") || strings.Contains(value, "\\") {
+		return false
+	}
+	return true
+}
+
+func isPlatformLogLine(line string) bool {
+	return strings.HasPrefix(line, "[dispatcher]") ||
+		strings.HasPrefix(line, "[runner]") ||
+		strings.HasPrefix(line, "[opencode]") ||
+		strings.HasPrefix(line, "\x1b[36m[agent]")
+}
+
+func stripANSI(text string) string {
+	return regexp.MustCompile(`\x1b\[[0-9;]*m`).ReplaceAllString(text, "")
+}
+
+func buildWriteup(task *Task, logs string) string {
+	var builder strings.Builder
+	builder.WriteString("# " + task.Name + "\n\n")
+	builder.WriteString("## 基本信息\n\n")
+	builder.WriteString("- 题型:" + task.Category + "\n")
+	builder.WriteString("- 状态:" + writeupStatus(task.Status) + "\n")
+	if task.TargetIP != "" {
+		builder.WriteString("- 目标:" + task.TargetIP + "\n")
+	}
+	if task.Flag != nil {
+		builder.WriteString("- Flag:" + *task.Flag + "\n")
+	}
+	if task.Error != nil {
+		builder.WriteString("- 错误:" + *task.Error + "\n")
+	}
+	builder.WriteString("\n## 题目描述\n\n")
+	builder.WriteString(task.Description + "\n\n")
+	builder.WriteString("## 解题过程\n\n")
+	body := formatWriteupBody(localizeWriteupText(cleanWriteupLogs(logs)))
+	if shouldUseWriteupFallback(task, body) {
+		body = fallbackWriteupBody(task)
+	}
+	builder.WriteString(body)
+	builder.WriteString("\n")
+	return builder.String()
+}
+
+func writeupStatus(status TaskStatus) string {
+	switch status {
+	case StatusQueued:
+		return "排队中"
+	case StatusRunning:
+		return "解题中"
+	case StatusSolved:
+		return "已出Flag"
+	case StatusFailed:
+		return "失败"
+	default:
+		return string(status)
+	}
+}
+
+func localizeWriteupText(text string) string {
+	replacer := strings.NewReplacer(
+		"Working on the crypto challenge", "正在分析密码题",
+		"I need to solve", "需要解出",
+		"My goal is to print the final flag", "目标是输出最终Flag",
+		"Since ", "因为",
+		"we can recreate", "可以复现",
+		"Flag:", "Flag:",
+		"Attachments are mounted read-only at /attachments.", "附件以只读方式挂载在/attachments。",
+		"Attachment files:", "附件文件:",
+		"End of file", "文件结束",
+		"total", "共",
+		"lines", "行",
+	)
+	return replacer.Replace(text)
+}
+
+func formatWriteupBody(text string) string {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = convertTaggedFileBlocks(text)
+	text = stripStandaloneContentTags(text)
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return "暂无可用解题过程。\n"
+	}
+	return text + "\n"
+}
+
+func shouldUseWriteupFallback(task *Task, body string) bool {
+	if task.Status == StatusSolved {
+		return false
+	}
+	trimmed := strings.TrimSpace(body)
+	if trimmed == "" || trimmed == "暂无可用解题过程。" {
+		return true
+	}
+	if len([]rune(trimmed)) < 80 && !strings.Contains(strings.ToLower(trimmed), "flag") {
+		return true
+	}
+	return false
+}
+
+func writeupNeedsRepair(task *Task, content string) bool {
+	if task.Status == StatusSolved {
+		return false
+	}
+	body := writeupProcessBody(content)
+	trimmed := strings.TrimSpace(body)
+	if trimmed == "" || trimmed == "暂无可用解题过程。" {
+		return true
+	}
+	if len([]rune(trimmed)) < 120 &&
+		(strings.HasPrefix(trimmed, "Thought: challenge=") ||
+			strings.HasPrefix(trimmed, "Action: start opencode")) {
+		return true
+	}
+	return false
+}
+
+func writeupProcessBody(content string) string {
+	if _, body, ok := strings.Cut(content, "## 解题过程"); ok {
+		return body
+	}
+	return content
+}
+
+func fallbackWriteupBody(task *Task) string {
+	var builder strings.Builder
+	builder.WriteString("平台尚未捕获到OpenCode最终可读输出。\n\n")
+	builder.WriteString("可能原因:\n\n")
+	builder.WriteString("- 模型仍在OpenCode会话中运行，但Go调度层已到达任务超时。\n")
+	builder.WriteString("- OpenCode会话已经产生过程，但桥接脚本尚未成功导出最终文本。\n")
+	builder.WriteString("- 模型输出没有包含可识别的Flag或完整中文WP。\n\n")
+	if task.OpenCodeSession != "" || task.OpenCodeWebURL != "" || task.ContainerKept {
+		builder.WriteString("建议继续操作:\n\n")
+	}
+	if task.OpenCodeSession != "" {
+		builder.WriteString("- OpenCode会话:" + task.OpenCodeSession + "\n")
+	}
+	if task.OpenCodeWebURL != "" {
+		builder.WriteString("- 打开任务详情中的OpenCode按钮查看当前会话。\n")
+	}
+	if task.ContainerKept {
+		builder.WriteString("- 容器仍保留，可以在任务详情里补充提示后继续解题，或手动关闭容器。\n")
+	}
+	if task.LastStep != "" {
+		builder.WriteString("\n最后捕获步骤:\n\n")
+		builder.WriteString(task.LastStep + "\n")
+	}
+	return builder.String()
+}
+
+func convertTaggedFileBlocks(text string) string {
+	var builder strings.Builder
+	rest := text
+	for {
+		pathStart := strings.Index(rest, "<path>")
+		if pathStart < 0 {
+			builder.WriteString(rest)
+			break
+		}
+		builder.WriteString(rest[:pathStart])
+		pathEnd := strings.Index(rest[pathStart:], "</path>")
+		if pathEnd < 0 {
+			builder.WriteString(rest[pathStart:])
+			break
+		}
+		pathEnd += pathStart
+		filePath := strings.TrimSpace(rest[pathStart+len("<path>") : pathEnd])
+		afterPath := rest[pathEnd+len("</path>"):]
+		contentStart := strings.Index(afterPath, "<content>")
+		if contentStart < 0 {
+			builder.WriteString(rest[pathStart : pathEnd+len("</path>")])
+			rest = afterPath
+			continue
+		}
+		contentEnd := strings.Index(afterPath[contentStart:], "</content>")
+		if contentEnd < 0 {
+			builder.WriteString(rest[pathStart:])
+			break
+		}
+		contentEnd += contentStart
+		prefix := afterPath[:contentStart]
+		content := afterPath[contentStart+len("<content>") : contentEnd]
+		if strings.Contains(prefix, "<type>file</type>") {
+			builder.WriteString(renderFileBlock(filePath, content))
+		} else {
+			builder.WriteString(rest[pathStart : pathEnd+len("</path>")])
+			builder.WriteString(prefix)
+			builder.WriteString("<content>")
+			builder.WriteString(content)
+			builder.WriteString("</content>")
+		}
+		rest = afterPath[contentEnd+len("</content>"):]
+	}
+	return builder.String()
+}
+
+func renderFileBlock(filePath string, content string) string {
+	cleaned := stripNumberedCodeLines(content)
+	if cleaned == "" {
+		return ""
+	}
+	var builder strings.Builder
+	builder.WriteString("\n### 文件`" + filePath + "`\n\n")
+	builder.WriteString("```" + codeFenceLanguage(filePath) + "\n")
+	builder.WriteString(cleaned)
+	if !strings.HasSuffix(cleaned, "\n") {
+		builder.WriteString("\n")
+	}
+	builder.WriteString("```\n\n")
+	return builder.String()
+}
+
+func stripNumberedCodeLines(content string) string {
+	lines := strings.Split(strings.ReplaceAll(content, "\r\n", "\n"), "\n")
+	cleaned := make([]string, 0, len(lines))
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			if len(cleaned) > 0 && cleaned[len(cleaned)-1] != "" {
+				cleaned = append(cleaned, "")
+			}
+			continue
+		}
+		if strings.HasPrefix(trimmed, "(") && strings.Contains(trimmed, "file") && strings.Contains(trimmed, "line") {
+			continue
+		}
+		cleaned = append(cleaned, stripLineNumberPrefix(line))
+	}
+	return strings.TrimSpace(strings.Join(cleaned, "\n"))
+}
+
+func stripLineNumberPrefix(line string) string {
+	trimmedLeft := strings.TrimLeft(line, " \t")
+	index := 0
+	for index < len(trimmedLeft) && trimmedLeft[index] >= '0' && trimmedLeft[index] <= '9' {
+		index++
+	}
+	if index > 0 && index < len(trimmedLeft) && trimmedLeft[index] == ':' {
+		trimmedLeft = trimmedLeft[index+1:]
+		if strings.HasPrefix(trimmedLeft, " ") {
+			trimmedLeft = trimmedLeft[1:]
+		}
+		return trimmedLeft
+	}
+	return line
+}
+
+func stripStandaloneContentTags(text string) string {
+	replacer := strings.NewReplacer(
+		"<type>file</type>", "",
+		"<content>", "",
+		"</content>", "",
+	)
+	return replacer.Replace(text)
+}
+
+func codeFenceLanguage(filePath string) string {
+	lower := strings.ToLower(filePath)
+	switch {
+	case strings.HasSuffix(lower, ".py"):
+		return "python"
+	case strings.HasSuffix(lower, ".js"):
+		return "javascript"
+	case strings.HasSuffix(lower, ".ts"):
+		return "typescript"
+	case strings.HasSuffix(lower, ".go"):
+		return "go"
+	case strings.HasSuffix(lower, ".c"), strings.HasSuffix(lower, ".h"):
+		return "c"
+	case strings.HasSuffix(lower, ".cpp"), strings.HasSuffix(lower, ".cc"), strings.HasSuffix(lower, ".hpp"):
+		return "cpp"
+	case strings.HasSuffix(lower, ".sh"):
+		return "bash"
+	case strings.HasSuffix(lower, ".json"):
+		return "json"
+	case strings.HasSuffix(lower, ".txt"), strings.HasSuffix(lower, ".log"):
+		return "text"
+	default:
+		return ""
+	}
+}
+
+func safeMarkdownFilename(name string) string {
+	name = strings.TrimSpace(name)
+	replacer := strings.NewReplacer(
+		"<", "_",
+		">", "_",
+		":", "_",
+		"\"", "_",
+		"/", "_",
+		"\\", "_",
+		"|", "_",
+		"?", "_",
+		"*", "_",
+		"\r", "_",
+		"\n", "_",
+		"\t", "_",
+	)
+	name = replacer.Replace(name)
+	name = strings.Trim(name, " .")
+	if name == "" {
+		name = "writeup"
+	}
+	if len([]rune(name)) > 120 {
+		runes := []rune(name)
+		name = string(runes[:120])
+	}
+	return name + ".md"
+}
+
+func trimWriteupLogs(logs string) string {
+	const maxChars = 60000
+	logs = strings.TrimSpace(logs)
+	if len(logs) <= maxChars {
+		return logs
+	}
+	return logs[:20000] + "\n\n...[日志过长，中间已省略]...\n\n" + logs[len(logs)-40000:]
+}
+
+func cleanWriteupLogs(logs string) string {
+	logs = strings.ReplaceAll(logs, "\r\n", "\n")
+	if extracted := extractReadableOutput(logs); extracted != "" {
+		return trimWriteupLogs(extracted)
+	}
+	return trimWriteupLogs(filterPlatformLogs(logs))
+}
+
+func extractReadableOutput(logs string) string {
+	const marker = "Observation: final readable OpenCode output:"
+	index := strings.LastIndex(logs, marker)
+	if index < 0 {
+		return ""
+	}
+	text := strings.TrimSpace(logs[index+len(marker):])
+	lines := strings.Split(text, "\n")
+	cleaned := make([]string, 0, len(lines))
+	skipSkillBlock := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			if len(cleaned) > 0 && cleaned[len(cleaned)-1] != "" {
+				cleaned = append(cleaned, "")
+			}
+			continue
+		}
+		if strings.HasPrefix(trimmed, "Final: opencode bridge completed") ||
+			strings.HasPrefix(trimmed, "[runner]") ||
+			strings.HasPrefix(trimmed, "[dispatcher]") ||
+			strings.HasPrefix(trimmed, "[opencode]") {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "Active CTF skills:") || strings.HasPrefix(trimmed, "--- skill:") {
+			skipSkillBlock = true
+			continue
+		}
+		if skipSkillBlock {
+			if strings.HasPrefix(trimmed, "Attachments are mounted") ||
+				strings.HasPrefix(trimmed, "Attachment files:") ||
+				strings.HasPrefix(trimmed, "**") ||
+				strings.HasPrefix(trimmed, "<path>") {
+				skipSkillBlock = false
+			} else {
+				continue
+			}
+		}
+		if strings.Contains(trimmed, "[skill truncated]") {
+			continue
+		}
+		cleaned = append(cleaned, line)
+	}
+	return strings.TrimSpace(strings.Join(cleaned, "\n"))
+}
+
+func filterPlatformLogs(logs string) string {
+	lines := strings.Split(logs, "\n")
+	cleaned := make([]string, 0, len(lines))
+	skipSkillBlock := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			if len(cleaned) > 0 && cleaned[len(cleaned)-1] != "" {
+				cleaned = append(cleaned, "")
+			}
+			continue
+		}
+		if strings.HasPrefix(trimmed, "[dispatcher]") ||
+			strings.HasPrefix(trimmed, "[runner]") ||
+			strings.HasPrefix(trimmed, "[opencode]") ||
+			strings.HasPrefix(trimmed, "Action: start opencode") ||
+			strings.HasPrefix(trimmed, "Action: send prompt through OpenCode") ||
+			strings.HasPrefix(trimmed, "Observation: OpenCode") ||
+			strings.HasPrefix(trimmed, "Observation: loaded CTF skill") ||
+			strings.HasPrefix(trimmed, "Observation: assistant output updated:") ||
+			strings.HasPrefix(trimmed, "Observation: final readable OpenCode output:") ||
+			strings.HasPrefix(trimmed, "Thought: wrote OpenCode provider config") ||
+			strings.HasPrefix(trimmed, "\x1b[36m[agent]") {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "Active CTF skills:") || strings.HasPrefix(trimmed, "--- skill:") {
+			skipSkillBlock = true
+			continue
+		}
+		if skipSkillBlock {
+			if strings.HasPrefix(trimmed, "Attachments are mounted") ||
+				strings.HasPrefix(trimmed, "Attachment files:") ||
+				strings.HasPrefix(trimmed, "<path>") ||
+				strings.HasPrefix(trimmed, "**") {
+				skipSkillBlock = false
+			} else {
+				continue
+			}
+		}
+		if strings.Contains(trimmed, "[skill truncated]") {
+			continue
+		}
+		cleaned = append(cleaned, line)
+	}
+	return strings.TrimSpace(strings.Join(cleaned, "\n"))
+}
+
+func summarizeLastStep(logs string) string {
+	lines := strings.Split(logs, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "[opencode] INFO") || strings.HasPrefix(line, "[opencode] DEBUG") {
+			continue
+		}
+		if len(line) > 220 {
+			line = line[:220]
+		}
+		return line
+	}
+	return "暂无可用步骤"
+}
+
+func max(a int, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}

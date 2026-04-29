@@ -1,0 +1,260 @@
+# OpenCode运行时权限设计
+
+## 结论
+
+可以让容器里的OpenCode进入“最大权限”模式，避免解题时频繁询问命令、读写、子代理、外部目录等操作是否允许。
+
+推荐的理解方式是：
+
+```text
+OpenCode层面:尽量自动批准，不打断Agent
+Docker层面:继续强隔离，限制Agent能伤害的范围
+```
+
+也就是说，最大权限只应该发生在单题Docker容器内部，不能等价为宿主机最大权限。容器仍然必须保留CPU、内存、进程数、capability、no-new-privileges、挂载目录只读等限制。
+
+## 当前执行链路
+
+```text
+Gin+HTML前端
+  -> Go API/SSE/WebSocket
+    -> Docker任务容器
+      -> runtime/opencode/bridge.py
+        -> opencode web
+          -> OpenCode会话
+            -> 模型网关
+```
+
+Go后端负责控制面：
+
+```text
+任务提交
+附件保存
+队列和并发Worker
+按题型选择Docker镜像
+Docker资源限制
+日志文件持久化
+WebSocket日志推送
+SSE任务状态事件
+OpenCode会话URL持久化
+最终输出最后一行Flag提取
+```
+
+OpenCode负责容器内执行面：
+
+```text
+模型调用
+会话上下文
+读取附件
+写入/workspace临时脚本
+执行shell命令
+调用内置工具和子代理
+生成解题输出
+```
+
+## 最大权限如何实现
+
+OpenCode官方权限模型支持三种动作：
+
+```text
+allow:无需审批直接运行
+ask:提示审批
+deny:阻止操作
+```
+
+如果想让所有OpenCode权限默认自动通过，可以在容器内`/workspace/opencode.json`写入：
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "permission": "allow"
+}
+```
+
+这种写法比逐个配置`bash`、`edit`、`read`、`external_directory`更直接，也能覆盖默认会询问的`external_directory`和`doom_loop`场景。
+
+当前`runtime/opencode/bridge.py`会为每道题生成`/workspace/opencode.json`，并已经使用最大权限模式：
+
+```python
+opencode_config = {
+    "$schema": "https://opencode.ai/config.json",
+    "model": f"{config.provider_id}/{config.model}",
+    "small_model": f"{config.provider_id}/{config.model}",
+    "permission": "allow",
+    "provider": {
+        config.provider_id: provider_config,
+    },
+}
+```
+
+## 为什么不能只靠OpenCode权限控制安全
+
+CTF附件和题目环境天然不可信。让OpenCode自动批准命令会提升解题效率，但也意味着模型可以连续执行更激进的命令，例如：
+
+```text
+批量解压和递归扫描
+运行未知二进制
+执行爆破脚本
+启动网络探测
+写入临时利用脚本
+反复调用同一工具
+读取工作目录外路径
+```
+
+这些行为对CTF是有价值的，但不能让它们越过容器边界。因此安全设计应该把“审批边界”从OpenCode迁移到Docker隔离层。
+
+## 必须保留的Docker边界
+
+最大权限模式下，以下边界不要放松：
+
+```text
+每题一个全新容器
+任务结束后销毁干净环境
+不挂载Docker socket
+不使用--privileged
+不挂载宿主机敏感目录
+附件目录/attachments只读挂载
+Skill目录/skills只读挂载
+Agent脚本只读挂载
+工作目录限定在/workspace
+限制内存CTF_AGENT_MEM_LIMIT
+限制CPU CTF_AGENT_CPUS
+限制进程数CTF_AGENT_PIDS_LIMIT
+cap-drop=ALL
+security-opt=no-new-privileges:true
+按需决定是否允许网络
+OpenCodeWeb默认只绑定127.0.0.1
+共享服务器设置OPENCODE_SERVER_PASSWORD
+```
+
+当前项目的Docker启动策略已经覆盖大部分边界：
+
+```text
+--memory
+--cpus
+--pids-limit
+--cap-drop ALL
+--security-opt no-new-privileges:true
+--tmpfs /tmp:rw,noexec,nosuid,size=64m
+-w /workspace
+/attachments:ro
+/skills:ro
+/opt/ctf_agent/agent.py:ro
+```
+
+## 推荐权限策略
+
+### 开发和本地CTF
+
+本地开发、单人使用、任务容器不暴露到公网时，推荐：
+
+```text
+OpenCode permission:allow
+Docker网络:按题目需要开启
+OpenCodeWeb:127.0.0.1
+容器失败后保留，支持继续提示
+成功出Flag后自动关闭容器
+```
+
+这是效率最高的模式，适合当前平台的主要目标。
+
+### 共享服务器
+
+多人使用或部署到服务器时，推荐：
+
+```text
+OpenCode permission:allow
+OpenCodeWeb设置密码
+反向代理增加认证
+限制每用户并发数
+限制容器网络出口
+记录容器stdout/stderr和任务元数据
+失败容器设置保留时间上限
+定期清理孤儿容器和旧任务
+```
+
+这时不要把OpenCodeWeb直接裸露到公网。
+
+### 高风险比赛环境
+
+如果题目附件来源不可信且可能包含恶意样本，推荐：
+
+```text
+OpenCode permission:allow或按题型降级
+Docker网络默认关闭
+只给Web题或远程服务题开启网络
+禁止宿主机目录写挂载
+保留更短的任务超时
+使用更小权限的题型专用镜像
+```
+
+## 不推荐的做法
+
+```text
+把宿主机Docker socket挂进容器
+使用--privileged运行题目容器
+把项目根目录以可写方式挂进容器
+把opencode.env或真实API Key挂进容器文件系统
+让OpenCodeWeb无密码暴露到公网
+成功解题后永久保留容器
+为了方便调试取消CPU/内存/进程限制
+```
+
+这些做法会让“容器内最大权限”变成“宿主机风险”。
+
+## 与Flag提取的关系
+
+权限策略不负责判断Flag。当前平台只使用一条主规则：
+
+```text
+OpenCode最终可读输出的最后一个非空行=Flag
+```
+
+`runtime/opencode/bridge.py`会要求OpenCode最终回复的最后一行只包含Flag本身。Go后端只从`Observation: final readable OpenCode output:`块中读取最后一个非空行；如果没有这个块，则不判定Flag。
+
+## 超时和输出导出
+
+OpenCode自身的模型请求可能比外层任务调度更久。如果Go调度层先超时，桥接脚本就没有机会执行：
+
+```text
+导出OpenCode会话
+提取final readable OpenCode output
+写入Flag和WP
+```
+
+因此当前项目要求：
+
+```text
+CTF_AGENT_TASK_TIMEOUT >= OPENCODE_TIMEOUT_SECONDS + 60
+```
+
+Go后端会自动做这个下限保护。失败或超时任务不会立即删除容器，用户可以继续打开OpenCode会话查看过程，或者在详情页补充提示后继续解题。
+
+## 当前验证步骤
+
+```text
+1.保留Docker所有资源和安全限制
+2.本地烟测一题，确认不再出现permission asking日志
+3.测试需要外部目录/重复命令/脚本写入的题目
+4.服务器部署前配置OpenCodeWeb密码和反向代理认证
+```
+
+## 相关文件
+
+```text
+runtime/opencode/bridge.py
+internal/app/docker.go
+internal/app/service.go
+internal/app/router.go
+docker/agent-base/Dockerfile
+docker/opencode-agent/Dockerfile
+docker/*-agent/Dockerfile
+opencode.env.example
+```
+
+## 参考
+
+```text
+OpenCode权限文档:
+https://opencode.ai/docs/zh-cn/permissions/
+```
