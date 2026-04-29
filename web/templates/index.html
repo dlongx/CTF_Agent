@@ -9,12 +9,24 @@
 </head>
 <body>
   <main class="shell">
-    <header class="topbar">
-      <div>
+    <header class="topbar home-topbar">
+      <div class="topbar-title">
         <p class="eyebrow">AI CTF AGENT</p>
-        <h1>自动化解题调度台</h1>
+        <div class="title-row">
+          <h1>自动化解题调度台</h1>
+          <div class="provider-panel top-provider-panel" id="provider-panel">
+            <div class="field">
+              <label for="provider-format">模型接口格式</label>
+              <select id="provider-format">
+                <option value="">加载中</option>
+              </select>
+            </div>
+            <p class="muted" id="provider-status">正在读取当前模型接口配置。</p>
+          </div>
+        </div>
       </div>
       <div class="topbar-actions">
+        <a class="button-link secondary" href="/containers">Docker管理</a>
         <div class="summary" id="summary">加载中</div>
       </div>
     </header>
@@ -82,14 +94,12 @@
             </select>
           </div>
           <div class="field">
-            <label for="filter-status">是否解完</label>
+            <label for="filter-status">任务状态</label>
             <select id="filter-status">
               <option value="">全部状态</option>
-              <option value="solved">已出Flag</option>
-              <option value="unsolved">未解完</option>
-              <option value="running">解题中</option>
-              <option value="queued">排队中</option>
-              <option value="failed">失败</option>
+              <option value="active">正在解题</option>
+              <option value="solved">已解出</option>
+              <option value="failed">未解出</option>
             </select>
           </div>
           <div class="field">

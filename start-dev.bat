@@ -28,6 +28,7 @@ if not defined CTF_AGENT_SKILLS_DIR set "CTF_AGENT_SKILLS_DIR=runtime\opencode\s
 if not defined CTF_AGENT_OPENCODE_WEB_ENABLED set "CTF_AGENT_OPENCODE_WEB_ENABLED=true"
 if not defined CTF_AGENT_OPENCODE_BIND_IP set "CTF_AGENT_OPENCODE_BIND_IP=127.0.0.1"
 if not defined CTF_AGENT_OPENCODE_PUBLIC_BASE_URL set "CTF_AGENT_OPENCODE_PUBLIC_BASE_URL=http://127.0.0.1"
+if not defined OPENCODE_PROVIDER_FORMAT set "OPENCODE_PROVIDER_FORMAT=openai-compatible"
 
 echo Starting Go CTF Agent development services...
 echo.
@@ -36,8 +37,7 @@ echo Docker image: %CTF_AGENT_DOCKER_IMAGE%
 echo Max containers: %CTF_AGENT_MAX_CONTAINERS%
 echo Skills dir: %CTF_AGENT_SKILLS_DIR%
 echo OpenCode web: %CTF_AGENT_OPENCODE_WEB_ENABLED% bind=%CTF_AGENT_OPENCODE_BIND_IP% public=%CTF_AGENT_OPENCODE_PUBLIC_BASE_URL%
-echo OpenCode provider: %OPENCODE_PROVIDER_ID%
-echo OpenCode model: %OPENCODE_MODEL%
+echo OpenCode provider format: %OPENCODE_PROVIDER_FORMAT%
 echo.
 
 if "%CHECK_ONLY%"=="1" (

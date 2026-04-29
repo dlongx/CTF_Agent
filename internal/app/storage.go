@@ -1,6 +1,7 @@
 package app
 
 import (
+	"errors"
 	"io"
 	"mime/multipart"
 	"os"
@@ -11,7 +12,18 @@ import (
 
 var unsafeName = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
 
+const (
+	maxMultipartFormBytes   = 256 << 20
+	maxMultipartMemoryBytes = 32 << 20
+	maxUploadedFileBytes    = maxMultipartFormBytes
+)
+
+var errUploadTooLarge = errors.New("uploaded file exceeds 256MiB limit")
+
 func prepareTaskDirs(root string, taskID string) (string, error) {
+	if !isSafeTaskID(taskID) {
+		return "", errors.New("invalid task id")
+	}
 	attachments := filepath.Join(root, taskID, "attachments")
 	return attachments, os.MkdirAll(attachments, 0o755)
 }
@@ -31,6 +43,9 @@ func saveUploadedFiles(files []*multipart.FileHeader, dst string) (int, error) {
 }
 
 func saveUploadedFile(header *multipart.FileHeader, dst string) error {
+	if header.Size > maxUploadedFileBytes {
+		return errUploadTooLarge
+	}
 	source, err := header.Open()
 	if err != nil {
 		return err
@@ -49,9 +64,17 @@ func saveUploadedFile(header *multipart.FileHeader, dst string) error {
 	if err != nil {
 		return err
 	}
-	defer output.Close()
-	_, err = io.Copy(output, source)
-	return err
+	written, copyErr := io.Copy(output, io.LimitReader(source, maxUploadedFileBytes+1))
+	closeErr := output.Close()
+	if copyErr != nil {
+		_ = os.Remove(target)
+		return copyErr
+	}
+	if written > maxUploadedFileBytes {
+		_ = os.Remove(target)
+		return errUploadTooLarge
+	}
+	return closeErr
 }
 
 func safeFilename(name string) string {

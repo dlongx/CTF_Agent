@@ -32,7 +32,6 @@ class BridgeConfig:
     skills_dir: Path
     skill_ids: tuple[str, ...]
     server_url: str
-    timeout_seconds: int
     provider_id: str
     provider_name: str
     provider_npm: str
@@ -58,7 +57,6 @@ def read_config() -> BridgeConfig:
         skills_dir=Path(os.getenv("CTF_AGENT_SKILLS_DIR", "/skills")),
         skill_ids=parse_skill_ids(os.getenv("CTF_AGENT_SKILL_IDS", "")),
         server_url=os.getenv("OPENCODE_SERVER_URL", "http://127.0.0.1:4096").rstrip("/"),
-        timeout_seconds=max(10, int(os.getenv("OPENCODE_TIMEOUT_SECONDS", "180"))),
         provider_id=os.getenv("OPENCODE_PROVIDER_ID", "").strip(),
         provider_name=os.getenv("OPENCODE_PROVIDER_NAME", "CTF Model Gateway").strip(),
         provider_npm=os.getenv("OPENCODE_PROVIDER_NPM", "@ai-sdk/openai-compatible").strip(),
@@ -84,7 +82,7 @@ def request_json(
     url: str,
     payload: dict[str, Any] | None = None,
     *,
-    timeout_seconds: int = 30,
+    timeout_seconds: int | None = 30,
 ) -> dict[str, Any]:
     """Send an HTTP JSON request to OpenCode Server."""
     data = None if payload is None else json.dumps(payload).encode("utf-8")
@@ -95,7 +93,11 @@ def request_json(
         method=method,
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+        if timeout_seconds is None:
+            response_context = urllib.request.urlopen(request)
+        else:
+            response_context = urllib.request.urlopen(request, timeout=timeout_seconds)
+        with response_context as response:
             body = response.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
@@ -327,13 +329,13 @@ def send_prompt(config: BridgeConfig, session_id: str, prompt: str) -> dict[str,
     """Send a user text part to OpenCode."""
     log(
         "Action: send prompt through OpenCode "
-        f"model={config.provider_id}/{config.model} timeout={config.timeout_seconds}s"
+        f"model={config.provider_id}/{config.model} timeout=disabled"
     )
     return request_json(
         "POST",
         f"{config.server_url}/session/{session_id}/message",
         {"parts": [{"type": "text", "text": prompt}]},
-        timeout_seconds=config.timeout_seconds,
+        timeout_seconds=None,
     )
 
 
@@ -357,10 +359,9 @@ def export_session(session_id: str) -> dict[str, Any]:
 
 def wait_for_session_text(config: BridgeConfig, session_id: str) -> str:
     """Poll exported session data until assistant text or final tool output appears."""
-    deadline = time.monotonic() + config.timeout_seconds
     last_text = ""
     stable_count = 0
-    while time.monotonic() < deadline:
+    while True:
         time.sleep(2)
         try:
             exported = export_session(session_id)
@@ -391,32 +392,72 @@ def log_delta_preview(text: str) -> None:
 
 def extract_text(value: Any) -> str:
     """Extract readable assistant/tool text from exported OpenCode JSON."""
-    blocks: list[str] = []
+    assistant_blocks: list[str] = []
+    fallback_blocks: list[str] = []
 
-    def walk(node: Any) -> None:
+    assistant_roles = {"assistant", "model", "agent"}
+    ignored_roles = {"user", "system"}
+
+    def append_block(text: str, role: str | None) -> None:
+        clean = text.strip()
+        if not clean:
+            return
+        if role in assistant_roles:
+            assistant_blocks.append(clean)
+            return
+        if role not in ignored_roles and not looks_like_prompt_echo(clean):
+            fallback_blocks.append(clean)
+
+    def walk(node: Any, inherited_role: str | None = None) -> None:
         if isinstance(node, dict):
+            role_value = node.get("role") or node.get("speaker")
+            role = str(role_value).strip().lower() if isinstance(role_value, str) else inherited_role
             text = node.get("text") or node.get("content") or node.get("message")
             if isinstance(text, str) and text.strip():
-                blocks.append(text.strip())
+                append_block(text, role)
             for key in ("output", "result", "error"):
                 item = node.get(key)
                 if isinstance(item, str) and item.strip():
-                    blocks.append(item.strip())
+                    append_block(item, role)
             for item in node.values():
-                walk(item)
+                walk(item, role)
         elif isinstance(node, list):
             for item in node:
-                walk(item)
+                walk(item, inherited_role)
 
     walk(value)
+    blocks = assistant_blocks or fallback_blocks
     deduped = []
     seen = set()
     for block in blocks:
+        if looks_like_prompt_echo(block):
+            continue
         if block in seen:
             continue
         seen.add(block)
         deduped.append(block)
     return "\n\n".join(deduped)
+
+
+def looks_like_prompt_echo(text: str) -> bool:
+    """Return true for exported user prompt or mounted skill text."""
+    normalized = text.strip().lower()
+    if not normalized:
+        return False
+    markers = (
+        "active ctf skills:",
+        "attachments are mounted read-only at /attachments",
+        "# ctf miscellaneous",
+        "quick reference for miscellaneous ctf challenges",
+        "allowed-tools:",
+        "compatibility:",
+        "license: mit",
+        "manual install:",
+        "quick start commands",
+        "[skill truncated]",
+        "you are solving a ctf challenge",
+    )
+    return sum(1 for marker in markers if marker in normalized) >= 2
 
 
 def run_bridge() -> int:

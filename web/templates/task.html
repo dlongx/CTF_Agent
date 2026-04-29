@@ -14,7 +14,10 @@
         <a class="back-link" href="/">返回任务列表</a>
         <h1 id="task-title">任务详情</h1>
       </div>
-      <span id="task-status" class="badge">加载中</span>
+      <div class="topbar-actions">
+        <a class="button-link secondary" href="/containers">Docker管理</a>
+        <span id="task-status" class="badge">加载中</span>
+      </div>
     </header>
 
     <section class="detail-grid">
@@ -32,8 +35,6 @@
           <dd id="task-flag">-</dd>
           <dt>错误</dt>
           <dd id="task-error">-</dd>
-          <dt>当前步骤</dt>
-          <dd id="task-last-step">-</dd>
           <dt>WP</dt>
           <dd id="task-writeup">-</dd>
           <dt>容器</dt>
@@ -48,7 +49,7 @@
           <textarea id="hint-input" rows="4" placeholder="输入新的思路、约束或提示，让保留容器继续尝试"></textarea>
           <div class="hint-actions">
             <button id="send-hint">继续解题</button>
-            <button class="secondary danger" id="close-container">关闭容器</button>
+            <a class="button-link secondary" href="/containers">去Docker管理</a>
           </div>
           <p class="muted" id="hint-status"></p>
         </div>

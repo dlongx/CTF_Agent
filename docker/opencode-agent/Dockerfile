@@ -12,7 +12,8 @@ RUN apt-get -o Acquire::Retries=5 update \
 RUN npm config set registry "${NPM_REGISTRY}" \
     && npm install -g \
         opencode-ai \
-        @ai-sdk/openai-compatible
+        @ai-sdk/openai-compatible \
+        @ai-sdk/anthropic
 
 WORKDIR /workspace
 

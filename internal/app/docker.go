@@ -10,7 +10,6 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"time"
 )
 
 type LogSink func(string)
@@ -29,6 +28,56 @@ type DockerEndpoint struct {
 	OpenCodeWebURL   string
 }
 
+type DockerContainer struct {
+	Name    string
+	Image   string
+	Status  string
+	Ports   string
+	Running bool
+}
+
+func ListDockerContainers() (map[string]DockerContainer, error) {
+	output, err := exec.Command(
+		"docker",
+		"ps",
+		"-a",
+		"--filter",
+		"name=ctf-agent-",
+		"--format",
+		"{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}",
+	).CombinedOutput()
+	if err != nil {
+		message := strings.TrimSpace(string(output))
+		if message == "" {
+			message = err.Error()
+		}
+		return nil, errors.New(message)
+	}
+	containers := map[string]DockerContainer{}
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 4)
+		for len(parts) < 4 {
+			parts = append(parts, "")
+		}
+		name := strings.TrimSpace(parts[0])
+		if name == "" {
+			continue
+		}
+		status := strings.TrimSpace(parts[2])
+		containers[name] = DockerContainer{
+			Name:    name,
+			Image:   strings.TrimSpace(parts[1]),
+			Status:  status,
+			Ports:   strings.TrimSpace(parts[3]),
+			Running: strings.HasPrefix(strings.ToLower(status), "up "),
+		}
+	}
+	return containers, nil
+}
+
 func RunDockerTask(cfg Config, task *Task, logSink LogSink, endpointSink func(DockerEndpoint)) (DockerResult, error) {
 	if cfg.AgentScript == "" {
 		return DockerResult{ExitCode: 2}, errors.New("CTF_AGENT_AGENT_SCRIPT is empty")
@@ -36,8 +85,7 @@ func RunDockerTask(cfg Config, task *Task, logSink LogSink, endpointSink func(Do
 	if cfg.SkillsDir == "" {
 		return DockerResult{ExitCode: 2}, errors.New("CTF_AGENT_SKILLS_DIR is empty")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.TaskTimeoutSeconds)*time.Second)
-	defer cancel()
+	ctx := context.Background()
 
 	containerName := "ctf-agent-" + task.ID
 	_ = exec.Command("docker", "rm", "-f", containerName).Run()
@@ -67,14 +115,10 @@ func RunDockerTask(cfg Config, task *Task, logSink LogSink, endpointSink func(Do
 		"-e", "CTF_AGENT_SKILLS_DIR=/skills",
 		"-e", "CTF_AGENT_SKILL_IDS="+normalizeCategory(task.Category),
 		"-e", "PYTHONUNBUFFERED=1",
-		"-e", "OPENCODE_TIMEOUT_SECONDS="+cfg.OpenCodeTimeoutSeconds,
-		"-e", "OPENCODE_PROVIDER_ID="+cfg.OpenCodeProviderID,
-		"-e", "OPENCODE_PROVIDER_NAME="+cfg.OpenCodeProviderName,
-		"-e", "OPENCODE_PROVIDER_NPM="+cfg.OpenCodeProviderNPM,
-		"-e", "OPENCODE_BASE_URL="+cfg.OpenCodeBaseURL,
-		"-e", "OPENCODE_API_KEY="+cfg.OpenCodeAPIKey,
-		"-e", "OPENCODE_MODEL="+cfg.OpenCodeModel,
 	)
+	for _, item := range openCodeProviderEnv(cfg) {
+		args = append(args, "-e", item)
+	}
 	if cfg.OpenCodeServerPassword != "" {
 		args = append(args, "-e", "OPENCODE_SERVER_PASSWORD="+cfg.OpenCodeServerPassword)
 	}
@@ -97,16 +141,6 @@ func RunDockerTask(cfg Config, task *Task, logSink LogSink, endpointSink func(Do
 	result.ContainerName = containerName
 	result.OpenCodeHostPort = endpoint.OpenCodeHostPort
 	result.OpenCodeWebURL = endpoint.OpenCodeWebURL
-	if ctx.Err() == context.DeadlineExceeded {
-		logSink("[runner] container timed out after " + strconvItoa(cfg.TaskTimeoutSeconds) + "s; retained for inspection\n")
-		return DockerResult{
-			ExitCode:         124,
-			ContainerName:    containerName,
-			Retained:         true,
-			OpenCodeHostPort: endpoint.OpenCodeHostPort,
-			OpenCodeWebURL:   endpoint.OpenCodeWebURL,
-		}, nil
-	}
 	if err != nil {
 		return result, err
 	}
@@ -123,22 +157,13 @@ func RunDockerHint(cfg Config, task *Task, hint string, logSink LogSink) (Docker
 	if task.ContainerName == "" || !task.ContainerKept {
 		return DockerResult{ExitCode: 2}, errors.New("no retained container for this task")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.TaskTimeoutSeconds)*time.Second)
-	defer cancel()
-	logSink("[runner] continuing retained container_name=" + task.ContainerName + "\n")
-	result, err := runAgentInContainer(ctx, task.ContainerName, []string{
-		"CTF_AGENT_USER_HINT=" + hint,
-	}, logSink)
-	if ctx.Err() == context.DeadlineExceeded {
-		logSink("[runner] retained container timed out after " + strconvItoa(cfg.TaskTimeoutSeconds) + "s; still retained for inspection\n")
-		return DockerResult{
-			ExitCode:         124,
-			ContainerName:    task.ContainerName,
-			Retained:         true,
-			OpenCodeHostPort: task.OpenCodeHostPort,
-			OpenCodeWebURL:   task.OpenCodeWebURL,
-		}, nil
+	if !isManagedContainerName(task.ContainerName) {
+		return DockerResult{ExitCode: 2}, errors.New("refusing unmanaged container name")
 	}
+	ctx := context.Background()
+	logSink("[runner] continuing retained container_name=" + task.ContainerName + "\n")
+	env := append(openCodeProviderEnv(cfg), "CTF_AGENT_USER_HINT="+hint)
+	result, err := runAgentInContainer(ctx, task.ContainerName, env, logSink)
 	if err != nil {
 		return result, err
 	}
@@ -155,11 +180,32 @@ func CloseTaskContainer(containerName string) error {
 	if strings.TrimSpace(containerName) == "" {
 		return errors.New("container name is empty")
 	}
+	if !isManagedContainerName(containerName) {
+		return errors.New("refusing unmanaged container name")
+	}
 	output, err := exec.Command("docker", "rm", "-f", containerName).CombinedOutput()
 	if err != nil {
-		return errors.New(string(output))
+		message := strings.TrimSpace(string(output))
+		if strings.Contains(strings.ToLower(message), "no such container") {
+			return nil
+		}
+		if message == "" {
+			message = err.Error()
+		}
+		return errors.New(message)
 	}
 	return nil
+}
+
+func openCodeProviderEnv(cfg Config) []string {
+	return []string{
+		"OPENCODE_PROVIDER_ID=" + cfg.OpenCodeProviderID,
+		"OPENCODE_PROVIDER_NAME=" + cfg.OpenCodeProviderName,
+		"OPENCODE_PROVIDER_NPM=" + cfg.OpenCodeProviderNPM,
+		"OPENCODE_BASE_URL=" + cfg.OpenCodeBaseURL,
+		"OPENCODE_API_KEY=" + cfg.OpenCodeAPIKey,
+		"OPENCODE_MODEL=" + cfg.OpenCodeModel,
+	}
 }
 
 func runAgentInContainer(ctx context.Context, containerName string, env []string, logSink LogSink) (DockerResult, error) {
@@ -254,4 +300,12 @@ func dockerMount(path string) string {
 		return strings.ReplaceAll(cleaned, "\\", "/")
 	}
 	return cleaned
+}
+
+func isManagedContainerName(name string) bool {
+	if !strings.HasPrefix(name, "ctf-agent-") {
+		return false
+	}
+	id := strings.TrimPrefix(name, "ctf-agent-")
+	return isSafeTaskID(id)
 }
