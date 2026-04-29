@@ -3,6 +3,7 @@ package app
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -21,13 +22,19 @@ func NewRouter(service *Service) *gin.Engine {
 	router.LoadHTMLGlob(filepath.Join(webDir, "templates", "*.html"))
 
 	router.GET("/", service.indexPage)
+	router.GET("/containers", service.containersPage)
 	router.GET("/tasks/:id", service.taskPage)
 	router.GET("/health", healthHandler)
 	router.GET("/api/events", service.taskEvents)
+	router.GET("/api/containers", service.listContainers)
+	router.GET("/api/settings/provider", service.providerSettings)
+	router.POST("/api/settings/provider", service.updateProviderSettings)
 	router.GET("/api/tasks", service.listTasks)
 	router.POST("/api/tasks", service.createTask)
 	router.OPTIONS("/api/tasks", optionsHandler)
 	router.OPTIONS("/api/events", optionsHandler)
+	router.OPTIONS("/api/containers", optionsHandler)
+	router.OPTIONS("/api/settings/provider", optionsHandler)
 	router.GET("/api/tasks/:id", service.taskDetail)
 	router.GET("/api/tasks/:id/logs", service.taskLogs)
 	router.GET("/api/tasks/:id/opencode", service.taskOpenCode)
@@ -100,6 +107,12 @@ func (s *Service) indexPage(c *gin.Context) {
 	})
 }
 
+func (s *Service) containersPage(c *gin.Context) {
+	c.HTML(200, "containers.html", gin.H{
+		"title": "Docker管理",
+	})
+}
+
 func (s *Service) taskPage(c *gin.Context) {
 	id := c.Param("id")
 	if _, ok := s.store.Get(id); !ok {
@@ -127,9 +140,41 @@ func (s *Service) listTasks(c *gin.Context) {
 	c.JSON(200, response)
 }
 
+func (s *Service) listContainers(c *gin.Context) {
+	c.JSON(200, s.ListManagedContainers())
+}
+
+func (s *Service) providerSettings(c *gin.Context) {
+	c.JSON(200, s.ProviderSettings())
+}
+
+func (s *Service) updateProviderSettings(c *gin.Context) {
+	var payload struct {
+		Format string `json:"format"`
+	}
+	if err := c.ShouldBindJSON(&payload); err != nil {
+		c.JSON(400, gin.H{"detail": "invalid provider payload"})
+		return
+	}
+	settings, err := s.SetProviderFormat(payload.Format)
+	if err != nil {
+		c.JSON(400, gin.H{"detail": err.Error()})
+		return
+	}
+	c.JSON(200, settings)
+}
+
 func (s *Service) createTask(c *gin.Context) {
-	if err := c.Request.ParseMultipartForm(256 << 20); err != nil {
-		c.JSON(400, gin.H{"detail": "invalid multipart form"})
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxMultipartFormBytes)
+	if err := c.Request.ParseMultipartForm(maxMultipartMemoryBytes); err != nil {
+		status := 400
+		detail := "invalid multipart form"
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			status = http.StatusRequestEntityTooLarge
+			detail = "multipart form exceeds 256MiB limit"
+		}
+		c.JSON(status, gin.H{"detail": detail})
 		return
 	}
 	name := strings.TrimSpace(c.Request.FormValue("name"))
@@ -137,6 +182,10 @@ func (s *Service) createTask(c *gin.Context) {
 	description := strings.TrimSpace(c.Request.FormValue("description"))
 	if name == "" || category == "" || description == "" {
 		c.JSON(400, gin.H{"detail": "name, type and description are required"})
+		return
+	}
+	if _, err := s.activeOpenCodeProvider(); err != nil {
+		c.JSON(400, gin.H{"detail": err.Error()})
 		return
 	}
 	taskID := s.NewTaskID()
@@ -148,6 +197,10 @@ func (s *Service) createTask(c *gin.Context) {
 	files := c.Request.MultipartForm.File["attachments"]
 	count, err := saveUploadedFiles(files, attachmentsDir)
 	if err != nil {
+		if errors.Is(err, errUploadTooLarge) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"detail": err.Error()})
+			return
+		}
 		c.JSON(500, gin.H{"detail": err.Error()})
 		return
 	}

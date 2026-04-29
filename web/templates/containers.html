@@ -1,0 +1,37 @@
+{{define "containers.html"}}
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.title}}</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <main class="shell containers-shell">
+    <header class="topbar">
+      <div>
+        <a class="back-link" href="/">返回任务列表</a>
+        <p class="eyebrow">DOCKER CONTROL</p>
+        <h1>Docker管理</h1>
+      </div>
+      <div class="topbar-actions">
+        <div class="summary" id="docker-summary">加载中</div>
+        <button class="secondary" id="docker-refresh">刷新</button>
+      </div>
+    </header>
+
+    <section class="docker-panel">
+      <div class="section-head">
+        <div>
+          <h2>容器占用</h2>
+          <p class="muted panel-note">只展示仍未销毁的任务容器，以及它对应的题目和当前状态。</p>
+        </div>
+      </div>
+      <div class="cards docker-cards" id="docker-cards"></div>
+    </section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>
+{{end}}

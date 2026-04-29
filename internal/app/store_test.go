@@ -1,6 +1,7 @@
 package app
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -49,6 +50,51 @@ func TestStorePersistsTaskAndLogs(t *testing.T) {
 	}
 }
 
+func TestStoreRejectsUnsafeTaskID(t *testing.T) {
+	t.Parallel()
+
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	err = store.Add(&Task{
+		ID:          "../escape",
+		Name:        "escape",
+		Category:    "misc",
+		Description: "escape",
+		Status:      StatusQueued,
+		CreatedAt:   time.Now().UTC(),
+	})
+	if err == nil {
+		t.Fatal("Add() accepted unsafe task id")
+	}
+	if _, ok := store.Get("../escape"); ok {
+		t.Fatal("Get() returned unsafe task id")
+	}
+}
+
+func TestStoreSkipsMismatchedTaskIDOnLoad(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	taskDir := filepath.Join(root, "task-dir")
+	if err := os.MkdirAll(taskDir, 0o755); err != nil {
+		t.Fatalf("mkdir task dir: %v", err)
+	}
+	meta := []byte(`{"id":"other-id","name":"bad","category":"misc","description":"bad","status":"queued"}`)
+	if err := os.WriteFile(filepath.Join(taskDir, "meta.json"), meta, 0o644); err != nil {
+		t.Fatalf("write meta: %v", err)
+	}
+
+	store, err := NewStore(root)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if got := store.List(); len(got) != 0 {
+		t.Fatalf("loaded mismatched task id: %+v", got)
+	}
+}
+
 func TestStoreRecoverableIDs(t *testing.T) {
 	t.Parallel()
 
@@ -62,6 +108,7 @@ func TestStoreRecoverableIDs(t *testing.T) {
 		{ID: "solved", Name: "done", Category: "misc", Description: "done", Status: StatusSolved, CreatedAt: now},
 		{ID: "queued", Name: "queued", Category: "misc", Description: "queued", Status: StatusQueued, CreatedAt: now.Add(time.Second)},
 		{ID: "running", Name: "running", Category: "misc", Description: "running", Status: StatusRunning, CreatedAt: now.Add(2 * time.Second)},
+		{ID: "retained-running", Name: "retained", Category: "misc", Description: "retained", Status: StatusRunning, ContainerName: "ctf-agent-retained-running", CreatedAt: now.Add(3 * time.Second)},
 	} {
 		if err := store.Add(task); err != nil {
 			t.Fatalf("Add(%s): %v", task.ID, err)
@@ -107,6 +154,135 @@ func TestStoreMarksFlaggedTaskSolvedRegardlessOfExitCode(t *testing.T) {
 	got, _ := store.Get(task.ID)
 	if got.Status != StatusSolved || got.Error != nil {
 		t.Fatalf("flagged task was not normalized as solved: %+v", got)
+	}
+}
+
+func TestStoreHidesWriteupForUnsolvedTask(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	store, err := NewStore(root)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	task := &Task{
+		ID:              "unsolved-writeup",
+		Name:            "unsolved-writeup",
+		Category:        "misc",
+		Description:     "not solved",
+		Status:          StatusFailed,
+		WriteupFileName: "wp.md",
+		CreatedAt:       time.Now().UTC(),
+	}
+	if err := store.Add(task); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, task.ID, "wp.md"), []byte("stale"), 0o644); err != nil {
+		t.Fatalf("write stale wp: %v", err)
+	}
+
+	if _, _, ok := store.WriteupPath(task.ID); ok {
+		t.Fatal("WriteupPath() returned stale writeup for unsolved task")
+	}
+}
+
+func TestStoreRejectsUnsafeWriteupFilename(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	store, err := NewStore(root)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	task := &Task{
+		ID:              "unsafe-writeup",
+		Name:            "unsafe-writeup",
+		Category:        "misc",
+		Description:     "unsafe writeup",
+		Status:          StatusSolved,
+		WriteupFileName: "../outside.md",
+		CreatedAt:       time.Now().UTC(),
+	}
+	if err := store.Add(task); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if _, _, ok := store.WriteupPath(task.ID); ok {
+		t.Fatal("WriteupPath() returned unsafe writeup filename")
+	}
+	if err := store.SaveWriteup(task.ID, "..\\outside.md", "bad"); err == nil {
+		t.Fatal("SaveWriteup() accepted unsafe filename")
+	}
+}
+
+func TestServiceRepairsInvalidSolvedFlag(t *testing.T) {
+	t.Parallel()
+
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	flag := "+"
+	task := &Task{
+		ID:          "invalid-flag",
+		Name:        "invalid-flag",
+		Category:    "misc",
+		Description: "invalid flag",
+		Status:      StatusSolved,
+		Flag:        &flag,
+		CreatedAt:   time.Now().UTC(),
+	}
+	if err := store.Add(task); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	service := &Service{store: store}
+	service.repairInvalidSolvedFlags()
+
+	got, _ := store.Get(task.ID)
+	if got.Status != StatusFailed || got.Flag != nil || got.Error == nil {
+		t.Fatalf("invalid solved flag was not repaired: %+v", got)
+	}
+}
+
+func TestManagedContainerNameValidation(t *testing.T) {
+	t.Parallel()
+
+	if !isManagedContainerName("ctf-agent-safe_task-1") {
+		t.Fatal("expected managed container name")
+	}
+	for _, name := range []string{"database", "ctf-agent-../escape", "ctf-agent-", "ctf-agent-bad/name"} {
+		if isManagedContainerName(name) {
+			t.Fatalf("accepted unmanaged container name %q", name)
+		}
+	}
+}
+
+func TestStoreMarksRunningTaskFailedWhenContainerClosed(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	store, err := NewStore(root)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	task := &Task{
+		ID:            "running-close",
+		Name:          "running-close",
+		Category:      "misc",
+		Description:   "running",
+		Status:        StatusRunning,
+		ContainerName: "ctf-agent-running-close",
+		CreatedAt:     time.Now().UTC(),
+	}
+	if err := store.Add(task); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := store.MarkContainerClosed(task.ID); err != nil {
+		t.Fatalf("MarkContainerClosed: %v", err)
+	}
+	got, _ := store.Get(task.ID)
+	if got.Status != StatusFailed || got.ContainerName != "" || got.ContainerKept || got.Error == nil {
+		t.Fatalf("closed running task was not marked failed: %+v", got)
 	}
 }
 
@@ -195,11 +371,43 @@ func TestExtractFlagIgnoresAssistantUpdateWithoutFinalReadableOutput(t *testing.
 关键步骤：
 1. 已还原载荷。
 - ` + "`iscc{a91b0bbf-e6fd-42dd-b9a6-5ef4f2bc695f}`" + `
-[runner] container timed out after 240s; retained for inspection`
+[runner] failed container retained for hints container_name=ctf-agent-demo`
 
 	got := service.extractFlagForTask(task, logs)
 	if got != nil {
 		t.Fatalf("extractFlagForTask()=%v want nil", *got)
+	}
+}
+
+func TestExtractFlagRejectsSingleCharacterPromptResidue(t *testing.T) {
+	t.Parallel()
+
+	service := &Service{}
+	task := &Task{}
+	logs := `Observation: final readable OpenCode output:
+Active CTF skills:
+Repunit decomposition uses only 1 and +.
++`
+
+	got := service.extractFlagForTask(task, logs)
+	if got != nil {
+		t.Fatalf("extractFlagForTask()=%v want nil", *got)
+	}
+}
+
+func TestOpenCodeStateReportsBridgeFailure(t *testing.T) {
+	t.Parallel()
+
+	message := "Final: opencode bridge failed: opencode server did not become ready"
+	task := &Task{
+		Status:   StatusFailed,
+		Error:    stringPtr("runner exited with status 1"),
+		LastStep: message,
+	}
+
+	status, gotMessage, available := openCodeState(task)
+	if status != "error" || gotMessage != message || available {
+		t.Fatalf("openCodeState()=(%q,%q,%v)", status, gotMessage, available)
 	}
 }
 
@@ -308,7 +516,7 @@ func TestBuildWriteupFallsBackWhenFinalOutputMissing(t *testing.T) {
 	logs := `[dispatcher] queued workers=4
 [runner] starting container image=ctf-agent-misc:latest
 Thought: challenge='timeout-demo' category='misc'
-[runner] container timed out after 240s; retained for inspection`
+[runner] failed container retained for hints container_name=ctf-agent-timeout-demo`
 
 	writeup := buildWriteup(task, logs)
 	if !strings.Contains(writeup, "平台尚未捕获到OpenCode最终可读输出") {
@@ -322,7 +530,7 @@ Thought: challenge='timeout-demo' category='misc'
 	}
 }
 
-func TestWriteupNeedsRepairForSparseFailedWriteup(t *testing.T) {
+func TestWriteupNeedsRepairIgnoresUnsolvedWriteup(t *testing.T) {
 	t.Parallel()
 
 	task := &Task{Status: StatusFailed}
@@ -333,8 +541,8 @@ func TestWriteupNeedsRepairForSparseFailedWriteup(t *testing.T) {
 Thought: challenge='timeout-demo' category='misc'
 `
 
-	if !writeupNeedsRepair(task, content) {
-		t.Fatal("writeupNeedsRepair()=false want true")
+	if writeupNeedsRepair(task, content) {
+		t.Fatal("writeupNeedsRepair()=true want false for unsolved task")
 	}
 }
 

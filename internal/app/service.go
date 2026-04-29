@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -20,6 +21,10 @@ type taskEvent struct {
 	TaskID string `json:"task_id,omitempty"`
 }
 
+type providerSelectionState struct {
+	Format string `json:"format"`
+}
+
 type Service struct {
 	cfg   Config
 	store *Store
@@ -27,9 +32,14 @@ type Service struct {
 	queue chan string
 	done  chan struct{}
 	wg    sync.WaitGroup
+	once  sync.Once
+
+	providerMu           sync.RWMutex
+	activeProviderFormat string
 }
 
 func NewService(cfg Config) (*Service, error) {
+	cfg = cfg.withOpenCodeProviderDefaults()
 	if err := os.MkdirAll(cfg.ChallengeDir, 0o755); err != nil {
 		return nil, err
 	}
@@ -44,8 +54,11 @@ func NewService(cfg Config) (*Service, error) {
 		queue: make(chan string, max(1, cfg.MaxContainers)*4),
 		done:  make(chan struct{}),
 	}
+	service.activeProviderFormat = service.loadProviderFormat()
 	service.repairFinishedTaskFlags()
+	service.repairInvalidSolvedFlags()
 	service.repairSparseWriteups()
+	service.recoverInterruptedRunningContainers()
 	for i := 0; i < max(1, cfg.MaxContainers); i++ {
 		service.wg.Add(1)
 		go service.worker(i)
@@ -62,8 +75,10 @@ func NewService(cfg Config) (*Service, error) {
 }
 
 func (s *Service) Close() {
-	close(s.done)
-	s.wg.Wait()
+	s.once.Do(func() {
+		close(s.done)
+		s.wg.Wait()
+	})
 }
 
 func (s *Service) NewTaskID() string {
@@ -75,6 +90,9 @@ func (s *Service) NewTaskID() string {
 }
 
 func (s *Service) Submit(task *Task) error {
+	if _, err := s.activeOpenCodeProvider(); err != nil {
+		return err
+	}
 	if err := s.store.Add(task); err != nil {
 		return err
 	}
@@ -82,6 +100,195 @@ func (s *Service) Submit(task *Task) error {
 	s.enqueue(task.ID)
 	s.AppendLog(task.ID, "[dispatcher] queued workers="+strconvItoa(max(1, s.cfg.MaxContainers))+"\n")
 	return nil
+}
+
+func (s *Service) ProviderSettings() providerSettingsResponse {
+	activeFormat := s.ActiveProviderFormat()
+	options := make([]providerOptionResponse, 0, 2)
+	for _, format := range []string{ProviderFormatOpenAICompatible, ProviderFormatAnthropic} {
+		provider, ok := s.cfg.ProviderForFormat(format)
+		if !ok {
+			continue
+		}
+		options = append(options, providerOptionResponse{
+			Format:            provider.Format,
+			Label:             provider.Label,
+			ProviderID:        provider.ProviderID,
+			ProviderName:      provider.ProviderName,
+			ProviderNPM:       provider.ProviderNPM,
+			Model:             provider.Model,
+			BaseURLConfigured: strings.TrimSpace(provider.BaseURL) != "",
+			APIKeyConfigured:  strings.TrimSpace(provider.APIKey) != "",
+			Configured:        provider.IsConfigured(),
+			Active:            provider.Format == activeFormat,
+		})
+	}
+	return providerSettingsResponse{ActiveFormat: activeFormat, Options: options}
+}
+
+func (s *Service) ActiveProviderFormat() string {
+	s.providerMu.RLock()
+	defer s.providerMu.RUnlock()
+	return s.activeProviderFormat
+}
+
+func (s *Service) SetProviderFormat(format string) (providerSettingsResponse, error) {
+	provider, ok := s.cfg.ProviderForFormat(format)
+	if !ok {
+		return providerSettingsResponse{}, errors.New("unsupported provider format")
+	}
+	if !provider.IsConfigured() {
+		return providerSettingsResponse{}, errors.New("provider is not fully configured")
+	}
+	if err := s.saveProviderFormat(provider.Format); err != nil {
+		return providerSettingsResponse{}, err
+	}
+	s.providerMu.Lock()
+	s.activeProviderFormat = provider.Format
+	s.providerMu.Unlock()
+	return s.ProviderSettings(), nil
+}
+
+func (s *Service) activeOpenCodeProvider() (OpenCodeProviderConfig, error) {
+	s.providerMu.RLock()
+	format := s.activeProviderFormat
+	s.providerMu.RUnlock()
+	provider, ok := s.cfg.ProviderForFormat(format)
+	if !ok {
+		return OpenCodeProviderConfig{}, errors.New("unsupported provider format")
+	}
+	if !provider.IsConfigured() {
+		return OpenCodeProviderConfig{}, errors.New("active provider is not fully configured")
+	}
+	return provider, nil
+}
+
+func (s *Service) activeDockerConfig() Config {
+	provider, err := s.activeOpenCodeProvider()
+	if err != nil {
+		return s.cfg
+	}
+	return s.cfg.WithOpenCodeProvider(provider)
+}
+
+func (s *Service) loadProviderFormat() string {
+	path := s.providerStatePath()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return s.cfg.OpenCodeProviderFormat
+	}
+	var state providerSelectionState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return s.cfg.OpenCodeProviderFormat
+	}
+	provider, ok := s.cfg.ProviderForFormat(state.Format)
+	if !ok || !provider.IsConfigured() {
+		return s.cfg.OpenCodeProviderFormat
+	}
+	return provider.Format
+}
+
+func (s *Service) saveProviderFormat(format string) error {
+	if err := os.MkdirAll(s.cfg.DataDir, 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(providerSelectionState{Format: format}, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(s.providerStatePath(), data, 0o644)
+}
+
+func (s *Service) providerStatePath() string {
+	return filepath.Join(s.cfg.DataDir, "provider.json")
+}
+
+func (s *Service) ListManagedContainers() containerListResponse {
+	tasks := s.store.List()
+	dockerContainers, err := ListDockerContainers()
+	dockerAvailable := err == nil
+	if dockerContainers == nil {
+		dockerContainers = map[string]DockerContainer{}
+	}
+	response := containerListResponse{
+		Containers:      buildManagedContainerResponses(tasks, dockerContainers, dockerAvailable, s.cfg),
+		DockerAvailable: dockerAvailable,
+		LiveCount:       len(dockerContainers),
+	}
+	if err != nil {
+		response.DockerError = err.Error()
+	}
+	response.TrackedCount = len(response.Containers)
+	return response
+}
+
+func buildManagedContainerResponses(tasks []*Task, dockerContainers map[string]DockerContainer, dockerAvailable bool, cfg Config) []containerResponse {
+	containers := make([]containerResponse, 0)
+	for _, task := range tasks {
+		if task.Flag != nil {
+			continue
+		}
+		containerName := task.ContainerName
+		if containerName == "" {
+			containerName = "ctf-agent-" + task.ID
+		}
+		dockerInfo, dockerFound := dockerContainers[containerName]
+		if dockerAvailable && !dockerFound {
+			continue
+		}
+		if !dockerAvailable && task.ContainerName == "" {
+			continue
+		}
+		switch {
+		case dockerFound:
+		case task.Status == StatusRunning || task.ContainerKept:
+		default:
+			continue
+		}
+		containerState := managedContainerState(task, dockerInfo, dockerFound, dockerAvailable)
+		image := cfg.ImageForCategory(task.Category)
+		if dockerInfo.Image != "" {
+			image = dockerInfo.Image
+		}
+		openCodeStatus, openCodeMessage, openCodeAvailable := openCodeState(task)
+		containers = append(containers, containerResponse{
+			TaskID:            task.ID,
+			TaskName:          task.Name,
+			Category:          task.Category,
+			TaskStatus:        task.Status,
+			ContainerName:     containerName,
+			ContainerState:    containerState,
+			Image:             image,
+			DockerStatus:      dockerInfo.Status,
+			DockerFound:       dockerFound,
+			DockerRunning:     dockerInfo.Running,
+			LastStep:          task.LastStep,
+			OpenCodeWebURL:    task.OpenCodeWebURL,
+			OpenCodeSession:   task.OpenCodeSession,
+			OpenCodeAvailable: openCodeAvailable,
+			OpenCodeStatus:    openCodeStatus,
+			OpenCodeMessage:   openCodeMessage,
+			HasWriteup:        task.Status == StatusSolved && task.WriteupFileName != "",
+			CreatedAt:         task.CreatedAt,
+			StartedAt:         task.StartedAt,
+			FinishedAt:        task.FinishedAt,
+			LogSize:           task.LogSize,
+		})
+	}
+	return containers
+}
+
+func managedContainerState(task *Task, dockerInfo DockerContainer, dockerFound bool, dockerAvailable bool) string {
+	if dockerAvailable && !dockerFound {
+		return "missing"
+	}
+	if dockerFound && !dockerInfo.Running {
+		return "exited"
+	}
+	if task.Status == StatusRunning || dockerInfo.Running {
+		return "running"
+	}
+	return "retained"
 }
 
 func (s *Service) AppendLog(taskID string, text string) {
@@ -135,6 +342,11 @@ func (s *Service) worker(index int) {
 		select {
 		case <-s.done:
 			return
+		default:
+		}
+		select {
+		case <-s.done:
+			return
 		case id := <-s.queue:
 			s.runTask(index, id)
 		}
@@ -154,7 +366,7 @@ func (s *Service) runTask(workerIndex int, taskID string) {
 	s.AppendLog(taskID, "[dispatcher] worker="+strconvItoa(workerIndex)+" picked task="+taskID+"\n")
 
 	result, err := RunDockerTask(
-		s.cfg,
+		s.activeDockerConfig(),
 		task,
 		func(text string) {
 			s.AppendLog(taskID, text)
@@ -173,10 +385,20 @@ func (s *Service) runTask(workerIndex int, taskID string) {
 		},
 	)
 	if err != nil {
+		if s.taskWasManuallyClosed(taskID) {
+			s.AppendLog(taskID, "[dispatcher] task stopped because container was closed manually\n")
+			s.publishTaskChanged(taskID)
+			return
+		}
 		s.AppendLog(taskID, "[dispatcher] task failed before completion: "+err.Error()+"\n")
 		_ = s.store.MarkFailed(taskID, err.Error())
 		s.publishTaskChanged(taskID)
 		s.AppendLog(taskID, "[dispatcher] task status=failed\n")
+		return
+	}
+	if s.taskWasManuallyClosed(taskID) {
+		s.AppendLog(taskID, "[dispatcher] task stopped because container was closed manually\n")
+		s.publishTaskChanged(taskID)
 		return
 	}
 
@@ -184,6 +406,11 @@ func (s *Service) runTask(workerIndex int, taskID string) {
 	flag := s.extractFlagForTask(task, logs)
 	lastStep := summarizeLastStep(logs)
 	solved := flag != nil
+	if !solved {
+		if openCodeErr := extractOpenCodeBridgeError(logs); openCodeErr != "" {
+			lastStep = openCodeErr
+		}
+	}
 	containerKept := result.Retained && !solved
 	if solved && result.ContainerName != "" {
 		if err := CloseTaskContainer(result.ContainerName); err != nil {
@@ -218,6 +445,9 @@ func (s *Service) ContinueTask(taskID string, hint string) error {
 	if task.Status == StatusRunning || task.Status == StatusQueued {
 		return errors.New("task is already running")
 	}
+	if _, err := s.activeOpenCodeProvider(); err != nil {
+		return err
+	}
 	if err := s.store.MarkRunning(taskID); err != nil {
 		return err
 	}
@@ -230,12 +460,22 @@ func (s *Service) ContinueTask(taskID string, hint string) error {
 		if !ok {
 			return
 		}
-		result, err := RunDockerHint(s.cfg, current, hint, func(text string) {
+		result, err := RunDockerHint(s.activeDockerConfig(), current, hint, func(text string) {
 			s.AppendLog(taskID, text)
 		})
 		if err != nil {
+			if s.taskWasManuallyClosed(taskID) {
+				s.AppendLog(taskID, "[dispatcher] continuation stopped because container was closed manually\n")
+				s.publishTaskChanged(taskID)
+				return
+			}
 			s.AppendLog(taskID, "[dispatcher] continuation failed: "+err.Error()+"\n")
 			_ = s.store.MarkFailed(taskID, err.Error())
+			s.publishTaskChanged(taskID)
+			return
+		}
+		if s.taskWasManuallyClosed(taskID) {
+			s.AppendLog(taskID, "[dispatcher] continuation stopped because container was closed manually\n")
 			s.publishTaskChanged(taskID)
 			return
 		}
@@ -243,6 +483,11 @@ func (s *Service) ContinueTask(taskID string, hint string) error {
 		flag := s.extractFlagForTask(current, logs)
 		lastStep := summarizeLastStep(logs)
 		solved := flag != nil
+		if !solved {
+			if openCodeErr := extractOpenCodeBridgeError(logs); openCodeErr != "" {
+				lastStep = openCodeErr
+			}
+		}
 		containerKept := result.Retained && !solved
 		if solved && result.ContainerName != "" {
 			if err := CloseTaskContainer(result.ContainerName); err != nil {
@@ -264,13 +509,18 @@ func (s *Service) ContinueTask(taskID string, hint string) error {
 	return nil
 }
 
+func (s *Service) taskWasManuallyClosed(taskID string) bool {
+	task, ok := s.store.Get(taskID)
+	return ok && task.Status == StatusFailed && task.ContainerName == "" && task.LastStep == containerClosedMessage
+}
+
 func (s *Service) CloseTaskContainer(taskID string) error {
 	task, ok := s.store.Get(taskID)
 	if !ok {
 		return os.ErrNotExist
 	}
-	if task.ContainerName == "" || !task.ContainerKept {
-		return errors.New("task has no retained container")
+	if task.ContainerName == "" || (!task.ContainerKept && task.Status != StatusRunning) {
+		return errors.New("task has no closable container")
 	}
 	if err := CloseTaskContainer(task.ContainerName); err != nil {
 		return err
@@ -279,13 +529,16 @@ func (s *Service) CloseTaskContainer(taskID string) error {
 		return err
 	}
 	s.publishTaskChanged(taskID)
-	s.AppendLog(taskID, "[dispatcher] retained container closed by user\n")
+	s.AppendLog(taskID, "[dispatcher] container closed by user\n")
 	return nil
 }
 
 func (s *Service) saveWriteup(taskID string) {
 	task, ok := s.store.Get(taskID)
 	if !ok {
+		return
+	}
+	if task.Status != StatusSolved || task.Flag == nil {
 		return
 	}
 	logs, _ := s.store.Logs(taskID)
@@ -300,7 +553,7 @@ func (s *Service) saveWriteup(taskID string) {
 
 func (s *Service) repairSparseWriteups() {
 	for _, task := range s.store.List() {
-		if task.Status == StatusQueued || task.Status == StatusRunning {
+		if task.Status != StatusSolved {
 			continue
 		}
 		path, _, ok := s.store.WriteupPath(task.ID)
@@ -343,6 +596,30 @@ func (s *Service) repairFinishedTaskFlags() {
 		if err := s.store.SaveWriteup(task.ID, safeMarkdownFilename(repaired.Name), buildWriteup(repaired, logs)); err != nil {
 			log.Printf("repair writeup after flag %s: %v", task.ID, err)
 		}
+	}
+}
+
+func (s *Service) repairInvalidSolvedFlags() {
+	for _, task := range s.store.List() {
+		if task.Flag == nil || isUsableFinalFlag(*task.Flag) {
+			continue
+		}
+		if err := s.store.MarkInvalidFlag(task.ID, "captured flag is invalid; OpenCode output did not contain a usable final flag"); err != nil {
+			log.Printf("repair invalid flag %s: %v", task.ID, err)
+		}
+	}
+}
+
+func (s *Service) recoverInterruptedRunningContainers() {
+	for _, task := range s.store.List() {
+		if task.Status != StatusRunning || task.ContainerName == "" {
+			continue
+		}
+		if err := s.store.MarkInterruptedContainerRetained(task.ID); err != nil {
+			log.Printf("retain interrupted container %s: %v", task.ID, err)
+			continue
+		}
+		s.AppendLog(task.ID, "[dispatcher] service restarted; existing container retained for manual inspection\n")
 	}
 }
 
@@ -400,13 +677,26 @@ func normalizeFinalFlagLine(line string) string {
 
 func isUsableFinalFlag(value string) bool {
 	value = strings.TrimSpace(value)
-	if value == "" || len([]rune(value)) > 300 {
+	runeCount := len([]rune(value))
+	if runeCount < 4 || runeCount > 300 {
 		return false
 	}
 	if strings.ContainsAny(value, " \t\r\n") {
 		return false
 	}
 	if strings.Contains(value, "/") || strings.Contains(value, "\\") {
+		return false
+	}
+	hasAlphaNum := false
+	for _, char := range value {
+		if char >= 'a' && char <= 'z' ||
+			char >= 'A' && char <= 'Z' ||
+			char >= '0' && char <= '9' {
+			hasAlphaNum = true
+			break
+		}
+	}
+	if !hasAlphaNum {
 		return false
 	}
 	return true
@@ -421,6 +711,17 @@ func isPlatformLogLine(line string) bool {
 
 func stripANSI(text string) string {
 	return regexp.MustCompile(`\x1b\[[0-9;]*m`).ReplaceAllString(text, "")
+}
+
+func extractOpenCodeBridgeError(logs string) string {
+	const marker = "Final: opencode bridge failed:"
+	for _, line := range reversedLines(logs) {
+		cleaned := strings.TrimSpace(stripANSI(line))
+		if strings.HasPrefix(cleaned, marker) {
+			return strings.TrimSpace(cleaned)
+		}
+	}
+	return ""
 }
 
 func buildWriteup(task *Task, logs string) string {
@@ -453,13 +754,13 @@ func buildWriteup(task *Task, logs string) string {
 func writeupStatus(status TaskStatus) string {
 	switch status {
 	case StatusQueued:
-		return "排队中"
+		return "正在解题"
 	case StatusRunning:
-		return "解题中"
+		return "正在解题"
 	case StatusSolved:
-		return "已出Flag"
+		return "已解出"
 	case StatusFailed:
-		return "失败"
+		return "未解出"
 	default:
 		return string(status)
 	}
@@ -508,7 +809,7 @@ func shouldUseWriteupFallback(task *Task, body string) bool {
 }
 
 func writeupNeedsRepair(task *Task, content string) bool {
-	if task.Status == StatusSolved {
+	if task.Status != StatusSolved {
 		return false
 	}
 	body := writeupProcessBody(content)
@@ -535,7 +836,7 @@ func fallbackWriteupBody(task *Task) string {
 	var builder strings.Builder
 	builder.WriteString("平台尚未捕获到OpenCode最终可读输出。\n\n")
 	builder.WriteString("可能原因:\n\n")
-	builder.WriteString("- 模型仍在OpenCode会话中运行，但Go调度层已到达任务超时。\n")
+	builder.WriteString("- 模型仍在OpenCode会话中运行，但尚未输出可识别Flag。\n")
 	builder.WriteString("- OpenCode会话已经产生过程，但桥接脚本尚未成功导出最终文本。\n")
 	builder.WriteString("- 模型输出没有包含可识别的Flag或完整中文WP。\n\n")
 	if task.OpenCodeSession != "" || task.OpenCodeWebURL != "" || task.ContainerKept {
@@ -548,7 +849,7 @@ func fallbackWriteupBody(task *Task) string {
 		builder.WriteString("- 打开任务详情中的OpenCode按钮查看当前会话。\n")
 	}
 	if task.ContainerKept {
-		builder.WriteString("- 容器仍保留，可以在任务详情里补充提示后继续解题，或手动关闭容器。\n")
+		builder.WriteString("- 容器仍保留，可以在任务详情里补充提示后继续解题，或在Docker管理页销毁容器。\n")
 	}
 	if task.LastStep != "" {
 		builder.WriteString("\n最后捕获步骤:\n\n")
