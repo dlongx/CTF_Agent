@@ -54,6 +54,86 @@ func TestHealthAndTaskListHandlers(t *testing.T) {
 	}
 }
 
+func TestAuthMiddlewareProtectsApplicationRoutes(t *testing.T) {
+	t.Parallel()
+
+	service := newTestService(t)
+	defer service.Close()
+	service.cfg.AccessToken = "test-access-token"
+	server := httptest.NewServer(NewRouter(service))
+	defer server.Close()
+
+	health, err := http.Get(server.URL + "/health")
+	if err != nil {
+		t.Fatalf("GET /health: %v", err)
+	}
+	defer health.Body.Close()
+	if health.StatusCode != http.StatusOK {
+		t.Fatalf("health status=%d", health.StatusCode)
+	}
+
+	unauthorized, err := http.Get(server.URL + "/api/tasks")
+	if err != nil {
+		t.Fatalf("GET unauthorized tasks: %v", err)
+	}
+	defer unauthorized.Body.Close()
+	if unauthorized.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status=%d want %d", unauthorized.StatusCode, http.StatusUnauthorized)
+	}
+
+	req, err := http.NewRequest(http.MethodGet, server.URL+"/api/tasks", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer test-access-token")
+	authorized, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET authorized tasks: %v", err)
+	}
+	defer authorized.Body.Close()
+	if authorized.StatusCode != http.StatusOK {
+		t.Fatalf("authorized status=%d want %d", authorized.StatusCode, http.StatusOK)
+	}
+}
+
+func TestCorsMiddlewareUsesExplicitAllowedOrigins(t *testing.T) {
+	t.Parallel()
+
+	service := newTestService(t)
+	defer service.Close()
+	service.cfg.AllowedOrigins = []string{"https://ctf.example"}
+	server := httptest.NewServer(NewRouter(service))
+	defer server.Close()
+
+	req, err := http.NewRequest(http.MethodOptions, server.URL+"/api/tasks", nil)
+	if err != nil {
+		t.Fatalf("NewRequest allowed: %v", err)
+	}
+	req.Header.Set("Origin", "https://ctf.example")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("OPTIONS allowed: %v", err)
+	}
+	defer resp.Body.Close()
+	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "https://ctf.example" {
+		t.Fatalf("allowed origin header=%q", got)
+	}
+
+	blockedReq, err := http.NewRequest(http.MethodOptions, server.URL+"/api/tasks", nil)
+	if err != nil {
+		t.Fatalf("NewRequest blocked: %v", err)
+	}
+	blockedReq.Header.Set("Origin", "https://evil.example")
+	blocked, err := http.DefaultClient.Do(blockedReq)
+	if err != nil {
+		t.Fatalf("OPTIONS blocked: %v", err)
+	}
+	defer blocked.Body.Close()
+	if got := blocked.Header.Get("Access-Control-Allow-Origin"); got != "" {
+		t.Fatalf("blocked origin should not receive CORS header, got %q", got)
+	}
+}
+
 func TestContainerListShowsRunningAndRetainedUnsolvedContainers(t *testing.T) {
 	t.Parallel()
 

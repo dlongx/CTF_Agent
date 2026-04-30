@@ -31,6 +31,33 @@ func TestImageForCategoryUsesOverrides(t *testing.T) {
 	}
 }
 
+func TestValidateServerSecurityRequiresTokenForPublicBind(t *testing.T) {
+	t.Parallel()
+
+	for _, addr := range []string{"127.0.0.1:8000", "localhost:8000", "[::1]:8000"} {
+		if err := (Config{Addr: addr}).ValidateServerSecurity(); err != nil {
+			t.Fatalf("loopback addr %q should not require token: %v", addr, err)
+		}
+	}
+	for _, addr := range []string{"0.0.0.0:8000", ":8000", "192.0.2.10:8000"} {
+		if err := (Config{Addr: addr}).ValidateServerSecurity(); err == nil {
+			t.Fatalf("public addr %q should require access token", addr)
+		}
+	}
+	if err := (Config{Addr: "0.0.0.0:8000", AccessToken: "token"}).ValidateServerSecurity(); err != nil {
+		t.Fatalf("public addr with token should be valid: %v", err)
+	}
+}
+
+func TestSplitCSVTrimsEmptyItems(t *testing.T) {
+	t.Parallel()
+
+	got := splitCSV(" https://a.example, ,https://b.example ")
+	if len(got) != 2 || got[0] != "https://a.example" || got[1] != "https://b.example" {
+		t.Fatalf("splitCSV=%v", got)
+	}
+}
+
 func TestLoadConfigDefaultsRuntimePaths(t *testing.T) {
 	t.Setenv("CTF_AGENT_AGENT_SCRIPT", "")
 	t.Setenv("CTF_AGENT_SKILLS_DIR", "")

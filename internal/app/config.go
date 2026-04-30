@@ -1,6 +1,8 @@
 package app
 
 import (
+	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -18,6 +20,8 @@ type Config struct {
 	MaxContainers          int
 	PidsLimit              string
 	DisableNetwork         bool
+	AccessToken            string
+	AllowedOrigins         []string
 	AgentScript            string
 	SkillsDir              string
 	OpenCodeProviderFormat string
@@ -68,6 +72,8 @@ func LoadConfig() Config {
 		MaxContainers:          getenvInt("CTF_AGENT_MAX_CONTAINERS", 4),
 		PidsLimit:              getenv("CTF_AGENT_PIDS_LIMIT", "1024"),
 		DisableNetwork:         getenvBool("CTF_AGENT_DISABLE_NETWORK", false),
+		AccessToken:            strings.TrimSpace(os.Getenv("CTF_AGENT_ACCESS_TOKEN")),
+		AllowedOrigins:         splitCSV(os.Getenv("CTF_AGENT_ALLOWED_ORIGINS")),
 		AgentScript:            absPath(root, getenv("CTF_AGENT_AGENT_SCRIPT", filepath.Join("runtime", "opencode", "bridge.py"))),
 		SkillsDir:              absPath(root, getenv("CTF_AGENT_SKILLS_DIR", filepath.Join("runtime", "opencode", "skills"))),
 		OpenCodeProviderFormat: providerFormat,
@@ -126,6 +132,13 @@ func (c Config) withOpenCodeProviderDefaults() Config {
 		return c.WithOpenCodeProvider(provider)
 	}
 	return c
+}
+
+func (c Config) ValidateServerSecurity() error {
+	if strings.TrimSpace(c.AccessToken) != "" || isLoopbackListenAddr(c.Addr) {
+		return nil
+	}
+	return errors.New("CTF_AGENT_ACCESS_TOKEN is required when CTF_AGENT_GO_ADDR is not a loopback address")
 }
 
 func (c Config) ProviderForFormat(format string) (OpenCodeProviderConfig, bool) {
@@ -250,6 +263,29 @@ func getenvBool(name string, fallback bool) bool {
 		return fallback
 	}
 	return value == "1" || value == "true" || value == "yes" || value == "on"
+}
+
+func splitCSV(value string) []string {
+	parts := strings.Split(value, ",")
+	items := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if item := strings.TrimSpace(part); item != "" {
+			items = append(items, item)
+		}
+	}
+	return items
+}
+
+func isLoopbackListenAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(addr))
+	if err != nil {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func absPath(root string, value string) string {

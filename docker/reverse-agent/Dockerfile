@@ -9,6 +9,7 @@ ENV LD_LIBRARY_PATH=/opt/android-stubs/x86_64:/opt/android-stubs/arm64-v8a
 ARG APT_MIRROR=http://deb.debian.org/debian
 ARG APT_SECURITY_MIRROR=http://deb.debian.org/debian-security
 ARG JADX_VERSION=1.5.2
+ARG JADX_SHA256=5a8b480839c9c61527895d81d5572182279d973abe112047417f237df958a3aa
 
 RUN sed -i "s|http://mirrors.ustc.edu.cn/debian-security|${APT_SECURITY_MIRROR}|g; \
     s|http://mirrors.ustc.edu.cn/debian|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources
@@ -40,6 +41,7 @@ RUN apt-get -o Acquire::Retries=5 update \
 
 RUN set -eux; \
     wget -O /tmp/jadx.zip "https://github.com/skylot/jadx/releases/download/v${JADX_VERSION}/jadx-${JADX_VERSION}.zip"; \
+    echo "${JADX_SHA256}  /tmp/jadx.zip" | sha256sum -c -; \
     mkdir -p /opt/jadx; \
     unzip -q /tmp/jadx.zip -d /opt/jadx; \
     chmod +x /opt/jadx/bin/jadx /opt/jadx/bin/jadx-gui; \

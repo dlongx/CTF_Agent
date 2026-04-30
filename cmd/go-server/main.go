@@ -14,6 +14,9 @@ import (
 
 func main() {
 	cfg := app.LoadConfig()
+	if err := cfg.ValidateServerSecurity(); err != nil {
+		log.Fatalf("invalid server security config: %v", err)
+	}
 	service, err := app.NewService(cfg)
 	if err != nil {
 		log.Fatalf("create service: %v", err)

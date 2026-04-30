@@ -155,6 +155,8 @@ Go后端启动时会扫描`data/challenges/*/meta.json`，状态为`queued`或`r
 
 ```text
 CTF_AGENT_GO_ADDR=127.0.0.1:8000
+CTF_AGENT_ACCESS_TOKEN=
+CTF_AGENT_ALLOWED_ORIGINS=
 CTF_AGENT_DATA_DIR=data
 CTF_AGENT_DOCKER_IMAGE=ctf-agent-opencode:latest
 CTF_AGENT_IMAGE_WEB=ctf-agent-web:latest
@@ -187,6 +189,8 @@ OPENCODE_ANTHROPIC_MODEL=claude-sonnet-4-5
 ```
 
 Go调度层和OpenCode桥接层不再设置解题总时长超时。任务会一直运行到解出Flag、容器内Agent退出，或用户在Docker管理页手动销毁容器。
+
+如果把`CTF_AGENT_GO_ADDR`改成`0.0.0.0:8000`、`:8000`或其他非回环地址，必须配置`CTF_AGENT_ACCESS_TOKEN`。浏览器访问页面时把该值作为HTTP Basic Auth密码；API客户端可使用`Authorization: Bearer <token>`。`CTF_AGENT_ALLOWED_ORIGINS`为空时不输出跨域头，只支持同源访问；需要跨域时填写明确来源，例如`https://ctf.example`，多个来源用英文逗号分隔。
 
 `ctf-agent-opencode:latest`同时安装`@ai-sdk/openai-compatible`和`@ai-sdk/anthropic`。前端“模型接口格式”只切换当前使用哪一组配置，不接收、不展示API Key；Key仍来自`opencode.env`。切换后只影响新启动或继续运行时新执行的容器，不会改变已经启动的容器。
 
@@ -260,6 +264,7 @@ CTF_AGENT_SKILL_IDS={题型}
 每个任务一个全新容器
 附件只读挂载到/attachments
 容器CPU、内存和进程数受限
+模型Provider环境变量只在执行Agent的docker exec阶段注入，不写入长期保留容器的创建配置
 成功出Flag后自动删除容器
 未解出任务容器会保留，用户可在终端下方发送消息继续同一OpenCodesession，或在Docker管理页手动销毁
 后端不启动、不暴露旧Web端口

@@ -105,9 +105,6 @@ func RunDockerTask(cfg Config, task *Task, logSink LogSink, containerSink func(s
 		"-e", "CTF_AGENT_SKILL_IDS="+normalizeCategory(task.Category),
 		"-e", "PYTHONUNBUFFERED=1",
 	)
-	for _, item := range openCodeProviderEnv(cfg) {
-		args = append(args, "-e", item)
-	}
 	if cfg.DisableNetwork {
 		args = append(args, "--network", "none")
 	}
@@ -122,7 +119,7 @@ func RunDockerTask(cfg Config, task *Task, logSink LogSink, containerSink func(s
 	if containerSink != nil {
 		containerSink(containerName)
 	}
-	result, err := runAgentInContainer(ctx, containerName, nil, logSink)
+	result, err := runAgentInContainer(ctx, containerName, openCodeProviderEnv(cfg), logSink)
 	result.ContainerName = containerName
 	if err != nil {
 		return result, err

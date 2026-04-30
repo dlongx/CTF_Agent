@@ -1,6 +1,7 @@
 package app
 
 import (
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"net/http"
@@ -16,15 +17,16 @@ import (
 func NewRouter(service *Service) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()
-	router.Use(gin.Logger(), gin.Recovery(), corsMiddleware())
+	router.Use(gin.Logger(), gin.Recovery(), corsMiddleware(service.cfg.AllowedOrigins))
 	webDir := findWebDir()
 	router.Static("/static", filepath.Join(webDir, "static"))
 	router.LoadHTMLGlob(filepath.Join(webDir, "templates", "*.html"))
 
+	router.GET("/health", healthHandler)
+	router.Use(authMiddleware(service.cfg.AccessToken))
 	router.GET("/", service.indexPage)
 	router.GET("/containers", service.containersPage)
 	router.GET("/tasks/:id", service.taskPage)
-	router.GET("/health", healthHandler)
 	router.GET("/api/events", service.taskEvents)
 	router.GET("/api/containers", service.listContainers)
 	router.GET("/api/settings/provider", service.providerSettings)
@@ -314,11 +316,56 @@ func (s *Service) taskCloseContainer(c *gin.Context) {
 	c.JSON(200, newTaskResponse(task))
 }
 
-func corsMiddleware() gin.HandlerFunc {
+func authMiddleware(token string) gin.HandlerFunc {
+	token = strings.TrimSpace(token)
 	return func(c *gin.Context) {
-		c.Header("Access-Control-Allow-Origin", "*")
+		if token == "" || c.Request.Method == http.MethodOptions || requestHasValidAccessToken(c.Request, token) {
+			c.Next()
+			return
+		}
+		c.Header("WWW-Authenticate", `Basic realm="CTF Agent"`)
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"detail": "authentication required"})
+	}
+}
+
+func requestHasValidAccessToken(req *http.Request, token string) bool {
+	if constantTimeStringEqual(req.Header.Get("X-CTF-Agent-Token"), token) {
+		return true
+	}
+	auth := strings.TrimSpace(req.Header.Get("Authorization"))
+	if strings.HasPrefix(strings.ToLower(auth), "bearer ") &&
+		constantTimeStringEqual(strings.TrimSpace(auth[len("bearer "):]), token) {
+		return true
+	}
+	_, password, ok := req.BasicAuth()
+	return ok && constantTimeStringEqual(password, token)
+}
+
+func constantTimeStringEqual(got string, want string) bool {
+	got = strings.TrimSpace(got)
+	want = strings.TrimSpace(want)
+	if got == "" || want == "" || len(got) != len(want) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}
+
+func corsMiddleware(allowedOrigins []string) gin.HandlerFunc {
+	allowed := make(map[string]struct{}, len(allowedOrigins))
+	for _, origin := range allowedOrigins {
+		if origin = strings.TrimSpace(origin); origin != "" && origin != "*" {
+			allowed[origin] = struct{}{}
+		}
+	}
+	return func(c *gin.Context) {
+		if origin := strings.TrimSpace(c.GetHeader("Origin")); origin != "" {
+			if _, ok := allowed[origin]; ok {
+				c.Header("Access-Control-Allow-Origin", origin)
+				c.Header("Vary", "Origin")
+			}
+		}
 		c.Header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-		c.Header("Access-Control-Allow-Headers", "*")
+		c.Header("Access-Control-Allow-Headers", "Authorization,Content-Type,X-CTF-Agent-Token")
 		if c.Request.Method == "OPTIONS" {
 			c.Status(204)
 			c.Abort()
