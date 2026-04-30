@@ -15,28 +15,26 @@ const (
 )
 
 type Task struct {
-	ID               string     `json:"id"`
-	Name             string     `json:"name"`
-	Category         string     `json:"category"`
-	Description      string     `json:"description"`
-	TargetIP         string     `json:"target_ip"`
-	AttachmentsDir   string     `json:"attachments_dir"`
-	AttachmentCount  int        `json:"attachment_count"`
-	Status           TaskStatus `json:"status"`
-	Flag             *string    `json:"flag"`
-	ExitCode         *int       `json:"exit_code"`
-	Error            *string    `json:"error"`
-	LastStep         string     `json:"last_step"`
-	WriteupFileName  string     `json:"writeup_file_name"`
-	ContainerName    string     `json:"container_name"`
-	ContainerKept    bool       `json:"container_kept"`
-	OpenCodeWebURL   string     `json:"opencode_web_url"`
-	OpenCodeHostPort string     `json:"opencode_host_port"`
-	OpenCodeSession  string     `json:"opencode_session"`
-	CreatedAt        time.Time  `json:"created_at"`
-	StartedAt        *time.Time `json:"started_at"`
-	FinishedAt       *time.Time `json:"finished_at"`
-	LogSize          int        `json:"log_size"`
+	ID              string     `json:"id"`
+	Name            string     `json:"name"`
+	Category        string     `json:"category"`
+	Description     string     `json:"description"`
+	TargetIP        string     `json:"target_ip"`
+	AttachmentsDir  string     `json:"attachments_dir"`
+	AttachmentCount int        `json:"attachment_count"`
+	Status          TaskStatus `json:"status"`
+	Flag            *string    `json:"flag"`
+	ExitCode        *int       `json:"exit_code"`
+	Error           *string    `json:"error"`
+	LastStep        string     `json:"last_step"`
+	WriteupFileName string     `json:"writeup_file_name"`
+	ContainerName   string     `json:"container_name"`
+	ContainerKept   bool       `json:"container_kept"`
+	OpenCodeSession string     `json:"opencode_session"`
+	CreatedAt       time.Time  `json:"created_at"`
+	StartedAt       *time.Time `json:"started_at"`
+	FinishedAt      *time.Time `json:"finished_at"`
+	LogSize         int        `json:"log_size"`
 }
 
 type taskResponse struct {
@@ -54,12 +52,12 @@ type taskResponse struct {
 	HasWriteup        bool       `json:"has_writeup"`
 	ContainerName     string     `json:"container_name"`
 	ContainerKept     bool       `json:"container_kept"`
-	OpenCodeWebURL    string     `json:"opencode_web_url"`
-	OpenCodeHostPort  string     `json:"opencode_host_port"`
 	OpenCodeSession   string     `json:"opencode_session"`
 	OpenCodeAvailable bool       `json:"opencode_available"`
 	OpenCodeStatus    string     `json:"opencode_status"`
 	OpenCodeMessage   string     `json:"opencode_message,omitempty"`
+	CanSendMessage    bool       `json:"can_send_message"`
+	MessageStatus     string     `json:"terminal_message_status"`
 	CreatedAt         time.Time  `json:"created_at"`
 	StartedAt         *time.Time `json:"started_at"`
 	FinishedAt        *time.Time `json:"finished_at"`
@@ -79,11 +77,12 @@ type containerResponse struct {
 	DockerFound       bool       `json:"docker_found"`
 	DockerRunning     bool       `json:"docker_running"`
 	LastStep          string     `json:"last_step"`
-	OpenCodeWebURL    string     `json:"opencode_web_url"`
 	OpenCodeSession   string     `json:"opencode_session"`
 	OpenCodeAvailable bool       `json:"opencode_available"`
 	OpenCodeStatus    string     `json:"opencode_status"`
 	OpenCodeMessage   string     `json:"opencode_message,omitempty"`
+	CanSendMessage    bool       `json:"can_send_message"`
+	MessageStatus     string     `json:"terminal_message_status"`
 	HasWriteup        bool       `json:"has_writeup"`
 	CreatedAt         time.Time  `json:"created_at"`
 	StartedAt         *time.Time `json:"started_at"`
@@ -119,6 +118,7 @@ type providerOptionResponse struct {
 
 func newTaskResponse(task *Task) taskResponse {
 	openCodeStatus, openCodeMessage, openCodeAvailable := openCodeState(task)
+	canSendMessage, messageStatus := terminalMessageState(task)
 	return taskResponse{
 		ID:                task.ID,
 		Name:              task.Name,
@@ -134,12 +134,12 @@ func newTaskResponse(task *Task) taskResponse {
 		HasWriteup:        task.Status == StatusSolved && task.WriteupFileName != "",
 		ContainerName:     task.ContainerName,
 		ContainerKept:     task.ContainerKept,
-		OpenCodeWebURL:    task.OpenCodeWebURL,
-		OpenCodeHostPort:  task.OpenCodeHostPort,
 		OpenCodeSession:   task.OpenCodeSession,
 		OpenCodeAvailable: openCodeAvailable,
 		OpenCodeStatus:    openCodeStatus,
 		OpenCodeMessage:   openCodeMessage,
+		CanSendMessage:    canSendMessage,
+		MessageStatus:     messageStatus,
 		CreatedAt:         task.CreatedAt,
 		StartedAt:         task.StartedAt,
 		FinishedAt:        task.FinishedAt,
@@ -155,17 +155,35 @@ func openCodeState(task *Task) (string, string, bool) {
 	if message := openCodeErrorMessage(task); message != "" {
 		return "error", message, false
 	}
-	available := task.OpenCodeWebURL != "" && (task.Status == StatusRunning || task.ContainerKept)
-	if available && task.OpenCodeSession != "" {
-		return "ready", "OpenCode会话可用", true
-	}
-	if available {
-		return "starting", "OpenCode服务已启动，等待会话初始化", true
-	}
 	if task.Status == StatusRunning && task.ContainerName != "" {
-		return "starting", "正在等待OpenCode服务端口", false
+		if task.OpenCodeSession != "" {
+			return "ready", "OpenCode终端会话运行中", true
+		}
+		return "starting", "OpenCode终端正在启动", false
+	}
+	if task.OpenCodeSession != "" {
+		return "ready", "OpenCode终端会话已记录", true
 	}
 	return "unavailable", "OpenCode服务不可用", false
+}
+
+func terminalMessageState(task *Task) (bool, string) {
+	if task == nil {
+		return false, "任务不存在"
+	}
+	switch task.Status {
+	case StatusQueued, StatusRunning:
+		return false, "当前回合运行中，结束后可继续发送"
+	case StatusSolved:
+		return false, "任务已解出"
+	}
+	if !task.ContainerKept || task.ContainerName == "" {
+		return false, "容器未保留，不能继续发送"
+	}
+	if strings.TrimSpace(task.OpenCodeSession) == "" {
+		return false, "缺少OpenCode终端会话，不能继续发送"
+	}
+	return true, "可以继续向OpenCode发送消息"
 }
 
 func openCodeErrorMessage(task *Task) string {

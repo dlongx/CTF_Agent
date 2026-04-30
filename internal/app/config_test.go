@@ -1,6 +1,7 @@
 package app
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -30,17 +31,6 @@ func TestImageForCategoryUsesOverrides(t *testing.T) {
 	}
 }
 
-func TestOpenCodeSessionURLUsesWorkspaceSlug(t *testing.T) {
-	t.Parallel()
-
-	cfg := Config{OpenCodeWebPublicBase: "http://127.0.0.1"}
-	got := cfg.OpenCodeSessionURL("49152", "ses_demo")
-	want := "http://127.0.0.1:49152/L3dvcmtzcGFjZQ/session/ses_demo"
-	if got != want {
-		t.Fatalf("OpenCodeSessionURL()=%q want %q", got, want)
-	}
-}
-
 func TestLoadConfigDefaultsRuntimePaths(t *testing.T) {
 	t.Setenv("CTF_AGENT_AGENT_SCRIPT", "")
 	t.Setenv("CTF_AGENT_SKILLS_DIR", "")
@@ -52,6 +42,52 @@ func TestLoadConfigDefaultsRuntimePaths(t *testing.T) {
 	}
 	if got := filepath.ToSlash(cfg.SkillsDir); !strings.HasSuffix(got, "runtime/opencode/skills") {
 		t.Fatalf("SkillsDir=%q", got)
+	}
+}
+
+func TestLoadConfigReadsLocalOpenCodeEnvFile(t *testing.T) {
+	root := t.TempDir()
+	previous, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatalf("Chdir: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(previous)
+	})
+	for _, name := range []string{
+		"OPENCODE_PROVIDER_FORMAT",
+		"OPENCODE_OPENAI_PROVIDER_ID",
+		"OPENCODE_OPENAI_PROVIDER_NPM",
+		"OPENCODE_OPENAI_BASE_URL",
+		"OPENCODE_OPENAI_API_KEY",
+		"OPENCODE_OPENAI_MODEL",
+	} {
+		t.Setenv(name, "")
+	}
+	content := strings.Join([]string{
+		"OPENCODE_PROVIDER_FORMAT=openai-compatible",
+		"OPENCODE_OPENAI_PROVIDER_ID=ctf",
+		"OPENCODE_OPENAI_PROVIDER_NPM=@ai-sdk/openai-compatible",
+		"OPENCODE_OPENAI_BASE_URL=https://gateway.example/v1",
+		"OPENCODE_OPENAI_API_KEY=local-key",
+		"OPENCODE_OPENAI_MODEL=local-model",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(root, "opencode.env"), []byte(content), 0o600); err != nil {
+		t.Fatalf("write opencode.env: %v", err)
+	}
+
+	cfg := LoadConfig()
+
+	if cfg.OpenCodeProviderFormat != ProviderFormatOpenAICompatible {
+		t.Fatalf("OpenCodeProviderFormat=%q", cfg.OpenCodeProviderFormat)
+	}
+	if cfg.OpenCodeBaseURL != "https://gateway.example/v1" ||
+		cfg.OpenCodeAPIKey != "local-key" ||
+		cfg.OpenCodeModel != "local-model" {
+		t.Fatalf("local opencode.env was not loaded: base=%q key_len=%d model=%q", cfg.OpenCodeBaseURL, len(cfg.OpenCodeAPIKey), cfg.OpenCodeModel)
 	}
 }
 

@@ -1,23 +1,27 @@
-"""Container-side bridge between the CTF platform and OpenCode Web.
+"""Container-side terminal bridge between the CTF platform and OpenCode.
 
-This bridge is intentionally lightweight. It starts an OpenCode Web server
-inside the task container, sends a challenge prompt, and prints server output to
-stdout so the existing Go API -> WebSocket -> Xterm pipeline can stay intact.
+The bridge runs ``opencode run --format json`` inside the task container and
+prints readable events to stdout so the existing Go API -> WebSocket -> terminal
+pipeline can stay intact.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
-import time
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 MAX_SKILL_CHARS = 12000
+FLAG_TOKEN_PATTERN = re.compile(r"\b[A-Za-z0-9_-]*flag\{[^`'\"<>\s]+\}", re.IGNORECASE)
+SOLVED_FLAG_MARKER = "这道题目已经解出"
+WRITEUP_BEGIN_MARKER = "-----BEGIN_CTF_AGENT_WRITEUP-----"
+WRITEUP_END_MARKER = "-----END_CTF_AGENT_WRITEUP-----"
+WORKSPACE_DIR = Path("/workspace")
+MAX_WRITEUP_CHARS = 120000
 
 
 @dataclass(frozen=True)
@@ -31,7 +35,6 @@ class BridgeConfig:
     attachment_dir: Path
     skills_dir: Path
     skill_ids: tuple[str, ...]
-    server_url: str
     provider_id: str
     provider_name: str
     provider_npm: str
@@ -39,6 +42,7 @@ class BridgeConfig:
     api_key: str
     model: str
     user_hint: str
+    session_id: str
 
 
 def log(message: str) -> None:
@@ -56,7 +60,6 @@ def read_config() -> BridgeConfig:
         attachment_dir=Path(os.getenv("ATTACHMENT_DIR", "/attachments")),
         skills_dir=Path(os.getenv("CTF_AGENT_SKILLS_DIR", "/skills")),
         skill_ids=parse_skill_ids(os.getenv("CTF_AGENT_SKILL_IDS", "")),
-        server_url=os.getenv("OPENCODE_SERVER_URL", "http://127.0.0.1:4096").rstrip("/"),
         provider_id=os.getenv("OPENCODE_PROVIDER_ID", "").strip(),
         provider_name=os.getenv("OPENCODE_PROVIDER_NAME", "CTF Model Gateway").strip(),
         provider_npm=os.getenv("OPENCODE_PROVIDER_NPM", "@ai-sdk/openai-compatible").strip(),
@@ -64,6 +67,7 @@ def read_config() -> BridgeConfig:
         api_key=os.getenv("OPENCODE_API_KEY", "").strip(),
         model=os.getenv("OPENCODE_MODEL", "").strip(),
         user_hint=os.getenv("CTF_AGENT_USER_HINT", "").strip(),
+        session_id=os.getenv("OPENCODE_SESSION_ID", "").strip(),
     )
 
 
@@ -75,66 +79,6 @@ def parse_skill_ids(raw: str) -> tuple[str, ...]:
         if normalized and normalized not in items:
             items.append(normalized)
     return tuple(items)
-
-
-def request_json(
-    method: str,
-    url: str,
-    payload: dict[str, Any] | None = None,
-    *,
-    timeout_seconds: int | None = 30,
-) -> dict[str, Any]:
-    """Send an HTTP JSON request to OpenCode Server."""
-    data = None if payload is None else json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(
-        url,
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method=method,
-    )
-    try:
-        if timeout_seconds is None:
-            response_context = urllib.request.urlopen(request)
-        else:
-            response_context = urllib.request.urlopen(request, timeout=timeout_seconds)
-        with response_context as response:
-            body = response.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {exc.code} from {url}: {body[:2000]}") from exc
-    if not body:
-        return {}
-    try:
-        return json.loads(body)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"non-JSON response from {url}: {body[:2000]}") from exc
-
-
-def start_server() -> subprocess.Popen[str]:
-    """Start OpenCode Web bound to the container network interface."""
-    workspace = Path("/workspace")
-    workspace.mkdir(parents=True, exist_ok=True)
-    runtime_tmp = Path("/workspace/.tmp")
-    runtime_tmp.mkdir(parents=True, exist_ok=True)
-    os.environ["TMPDIR"] = str(runtime_tmp)
-    log_file = Path("/workspace/opencode-web.log").open("a", encoding="utf-8")
-    return subprocess.Popen(
-        [
-            "opencode",
-            "web",
-            "--hostname",
-            "0.0.0.0",
-            "--port",
-            "4096",
-            "--print-logs",
-            "--log-level",
-            os.getenv("OPENCODE_LOG_LEVEL", "WARN"),
-        ],
-        cwd=str(workspace),
-        text=True,
-        stdout=log_file,
-        stderr=subprocess.STDOUT,
-    )
 
 
 def configure_opencode(config: BridgeConfig) -> None:
@@ -150,6 +94,14 @@ def configure_opencode(config: BridgeConfig) -> None:
         raise RuntimeError("OPENCODE_BASE_URL is required when OPENCODE_MODEL is set")
     if not config.api_key:
         raise RuntimeError("OPENCODE_API_KEY is required when OPENCODE_MODEL is set")
+    if (
+        config.provider_npm == "@ai-sdk/anthropic"
+        and not config.base_url.lower().rstrip("/").endswith("/v1")
+    ):
+        log(
+            "Warning: Anthropic-compatible OPENCODE_BASE_URL usually ends with /v1; "
+            f"current value is {config.base_url!r}."
+        )
 
     provider_config = {
         "npm": config.provider_npm,
@@ -173,7 +125,8 @@ def configure_opencode(config: BridgeConfig) -> None:
             config.provider_id: provider_config,
         },
     }
-    Path("/workspace/opencode.json").write_text(
+    WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
+    (WORKSPACE_DIR / "opencode.json").write_text(
         json.dumps(opencode_config, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
@@ -183,19 +136,38 @@ def configure_opencode(config: BridgeConfig) -> None:
     )
 
 
-def wait_for_server(config: BridgeConfig, process: subprocess.Popen[str]) -> None:
-    """Wait until OpenCode Server responds or the process exits."""
-    deadline = time.monotonic() + 30
-    while time.monotonic() < deadline:
-        if process.poll() is not None:
-            output = process.stdout.read() if process.stdout else ""
-            raise RuntimeError(f"opencode server exited early: {output}")
-        try:
-            request_json("GET", f"{config.server_url}/global/health", timeout_seconds=5)
-            return
-        except (OSError, urllib.error.URLError):
-            time.sleep(0.5)
-    raise RuntimeError("opencode server did not become ready")
+def sanitize_log_text(text: str, config: BridgeConfig) -> str:
+    """Remove sensitive values from OpenCode diagnostics."""
+    if config.api_key:
+        text = text.replace(config.api_key, "***MASKED***")
+    return text
+
+
+def safe_markdown_stem(name: str, max_chars: int = 120) -> str:
+    """Return a filename-safe Markdown stem while preserving readable CTF names."""
+    stem = name.strip()
+    for char in '<>:"/\\|?*\r\n\t':
+        stem = stem.replace(char, "_")
+    stem = stem.strip(" .")
+    if not stem:
+        stem = "writeup"
+    if len(stem) > max_chars:
+        stem = stem[:max_chars].strip(" .") or "writeup"
+    return stem
+
+
+def writeup_filename(config: BridgeConfig) -> str:
+    """Return the fixed writeup filename requested by the platform contract."""
+    stem = safe_markdown_stem(config.name)
+    if stem.lower().endswith("_wp"):
+        return f"{stem}.md"
+    stem = safe_markdown_stem(stem, 117)
+    return f"{stem}_wp.md"
+
+
+def writeup_path(config: BridgeConfig) -> Path:
+    """Return the only writeup path the bridge will read or create."""
+    return WORKSPACE_DIR / writeup_filename(config)
 
 
 def category_guidance(category: str) -> str:
@@ -284,6 +256,8 @@ def build_prompt(config: BridgeConfig) -> str:
     if config.attachment_dir.exists():
         files = [str(path) for path in sorted(config.attachment_dir.rglob("*")) if path.is_file()]
     skill_text = read_skill_text(config)
+    wp_name = writeup_filename(config)
+    wp_path = f"/workspace/{wp_name}"
 
     return (
         "You are solving a CTF challenge inside an isolated Docker container.\n"
@@ -294,10 +268,18 @@ def build_prompt(config: BridgeConfig) -> str:
         "When you summarize the solution, write all narrative explanations in Simplified Chinese. "
         "Keep commands, source code, file names, technical identifiers, formulas, and flags unchanged. "
         "Do not write English writeup prose unless it is part of source code or command output.\n\n"
-        "Your final response must end with one standalone final line containing only the exact flag. "
-        "Do not wrap that final line in Markdown, do not prefix it with 'Flag:', and do not add any text "
-        "after it. The platform will treat this last non-empty line as the captured flag, regardless of "
-        "flag wrapper format.\n\n"
+        "When you solve the challenge, your final response must contain this exact two-line marker block:\n"
+        f"{SOLVED_FLAG_MARKER}\n"
+        "<exact flag>\n"
+        "The marker line must be exactly the Chinese sentence above. The next non-empty line must contain "
+        "only the exact flag, with no Markdown, no label, no quotes, and no extra text. The flag wrapper "
+        "may be flag{}, DASCTF{}, ISCC{}, or any challenge-specific wrapper.\n\n"
+        f"Before the final response, create or overwrite the Markdown writeup file `{wp_path}`. "
+        "The writeup must be written in Simplified Chinese, except commands, code, filenames, formulas, "
+        "technical identifiers, and flags. Do not paste raw OpenCode logs. Do not include API keys, "
+        "environment variables, provider settings, or platform dispatcher logs. The Markdown file should "
+        "include these sections: 题目概况, 解题思路, 关键步骤, 关键命令与输出, Flag, 复现步骤, 注意事项. "
+        f"The platform will use `{wp_name}` as the final WP download file.\n\n"
         f"Name: {config.name}\n"
         f"Category: {config.category}\n"
         f"Target IP: {config.target_ip or 'not provided'}\n"
@@ -312,72 +294,23 @@ def build_prompt(config: BridgeConfig) -> str:
     )
 
 
-def create_session(config: BridgeConfig) -> str:
-    """Create an OpenCode session and return its id."""
-    response = request_json("POST", f"{config.server_url}/session", {"title": config.name})
-    session_id = (
-        response.get("id")
-        or response.get("sessionID")
-        or response.get("session", {}).get("id")
+def build_continuation_prompt(config: BridgeConfig) -> str:
+    """Build a concise continuation prompt for an existing OpenCode session."""
+    hint = config.user_hint.strip()
+    wp_name = writeup_filename(config)
+    wp_path = f"/workspace/{wp_name}"
+    return (
+        "继续同一个CTF题目的解题会话。请根据用户补充信息继续分析，"
+        "不要重复已经完成的无关枚举。若本轮解出题目或修正了解法，必须创建或覆盖"
+        f"`{wp_path}`，写入结构化中文Markdown WP，包含题目概况、解题思路、关键步骤、"
+        "关键命令与输出、Flag、复现步骤和注意事项。不要把原始OpenCode日志当WP。\n\n"
+        "找到Flag后必须按以下两行格式收尾:\n"
+        f"{SOLVED_FLAG_MARKER}\n"
+        "<exact flag>\n\n"
+        f"平台最终会保存`{wp_name}`作为WP文件。\n\n"
+        "用户补充信息:\n"
+        f"{hint}"
     )
-    if not session_id:
-        raise RuntimeError(f"could not determine session id from response: {response}")
-    return str(session_id)
-
-
-def send_prompt(config: BridgeConfig, session_id: str, prompt: str) -> dict[str, Any]:
-    """Send a user text part to OpenCode."""
-    log(
-        "Action: send prompt through OpenCode "
-        f"model={config.provider_id}/{config.model} timeout=disabled"
-    )
-    return request_json(
-        "POST",
-        f"{config.server_url}/session/{session_id}/message",
-        {"parts": [{"type": "text", "text": prompt}]},
-        timeout_seconds=None,
-    )
-
-
-def export_session(session_id: str) -> dict[str, Any]:
-    """Export OpenCode session JSON through CLI for robust response extraction."""
-    result = subprocess.run(
-        ["opencode", "export", session_id],
-        cwd="/workspace",
-        text=True,
-        capture_output=True,
-        timeout=20,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "opencode export failed")
-    text = result.stdout.strip()
-    if not text:
-        return {}
-    return json.loads(text)
-
-
-def wait_for_session_text(config: BridgeConfig, session_id: str) -> str:
-    """Poll exported session data until assistant text or final tool output appears."""
-    last_text = ""
-    stable_count = 0
-    while True:
-        time.sleep(2)
-        try:
-            exported = export_session(session_id)
-        except Exception as exc:
-            last_text = f"Unable to export session yet: {exc}"
-            continue
-        text = extract_text(exported)
-        if text and text == last_text:
-            stable_count += 1
-        elif text:
-            stable_count = 0
-            last_text = text
-            log_delta_preview(text)
-        if last_text and stable_count >= 2:
-            return last_text
-    return last_text
 
 
 def log_delta_preview(text: str) -> None:
@@ -390,53 +323,48 @@ def log_delta_preview(text: str) -> None:
     log(tail)
 
 
-def extract_text(value: Any) -> str:
-    """Extract readable assistant/tool text from exported OpenCode JSON."""
-    assistant_blocks: list[str] = []
-    fallback_blocks: list[str] = []
+def extract_flag_token(text: str) -> str:
+    """Return the last flag-looking token found in text."""
+    matches = FLAG_TOKEN_PATTERN.findall(text)
+    if not matches:
+        return ""
+    return matches[-1].strip()
 
-    assistant_roles = {"assistant", "model", "agent"}
-    ignored_roles = {"user", "system"}
 
-    def append_block(text: str, role: str | None) -> None:
-        clean = text.strip()
-        if not clean:
-            return
-        if role in assistant_roles:
-            assistant_blocks.append(clean)
-            return
-        if role not in ignored_roles and not looks_like_prompt_echo(clean):
-            fallback_blocks.append(clean)
-
-    def walk(node: Any, inherited_role: str | None = None) -> None:
-        if isinstance(node, dict):
-            role_value = node.get("role") or node.get("speaker")
-            role = str(role_value).strip().lower() if isinstance(role_value, str) else inherited_role
-            text = node.get("text") or node.get("content") or node.get("message")
-            if isinstance(text, str) and text.strip():
-                append_block(text, role)
-            for key in ("output", "result", "error"):
-                item = node.get(key)
-                if isinstance(item, str) and item.strip():
-                    append_block(item, role)
-            for item in node.values():
-                walk(item, role)
-        elif isinstance(node, list):
-            for item in node:
-                walk(item, inherited_role)
-
-    walk(value)
-    blocks = assistant_blocks or fallback_blocks
-    deduped = []
-    seen = set()
-    for block in blocks:
-        if looks_like_prompt_echo(block):
+def extract_marked_flag(text: str) -> str:
+    """Return the first line after the solved marker."""
+    lines = text.replace("\r\n", "\n").split("\n")
+    for index, line in enumerate(lines):
+        if line.strip() != SOLVED_FLAG_MARKER:
             continue
-        if block in seen:
+        if marker_looks_instructional(lines, index):
             continue
-        seen.add(block)
-        deduped.append(block)
-    return "\n\n".join(deduped)
+        for candidate in lines[index + 1 :]:
+            clean = candidate.strip().strip("`'\"，。；;")
+            if clean:
+                return clean
+    return ""
+
+
+def marker_looks_instructional(lines: list[str], index: int) -> bool:
+    """Avoid treating prompt examples as solved-marker output."""
+    context = "\n".join(lines[max(0, index - 4) : index]).lower()
+    markers = (
+        "prompt要求",
+        "final output contract",
+        "flag output contract",
+        "strictly output",
+        "marker block",
+        "最终严格输出",
+        "按以下两行",
+        "格式收尾",
+        "格式要求",
+        "示例",
+        "example",
+        "<exact flag>",
+        "<captured-or-last-line>",
+    )
+    return any(marker in context for marker in markers)
 
 
 def looks_like_prompt_echo(text: str) -> bool:
@@ -456,8 +384,242 @@ def looks_like_prompt_echo(text: str) -> bool:
         "quick start commands",
         "[skill truncated]",
         "you are solving a ctf challenge",
+        "prompt要求opencode最终严格输出",
+        "final output contract",
+        "flag output contract",
+        "strictly output",
+        "marker block",
+        "最终严格输出",
+        "按以下两行",
+        "格式收尾",
+        "这道题目已经解出",
     )
     return sum(1 for marker in markers if marker in normalized) >= 2
+
+
+def extract_session_id(value: Any) -> str:
+    """Find an OpenCode session id in a JSON event."""
+    if isinstance(value, dict):
+        for key in ("sessionID", "sessionId", "session_id"):
+            item = value.get(key)
+            if isinstance(item, str) and item.strip():
+                return item.strip()
+        session = value.get("session")
+        if isinstance(session, dict):
+            item = session.get("id")
+            if isinstance(item, str) and item.strip():
+                return item.strip()
+        for item in value.values():
+            found = extract_session_id(item)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for item in value:
+            found = extract_session_id(item)
+            if found:
+                return found
+    return ""
+
+
+def should_keep_event_text(text: str) -> bool:
+    """Filter obvious metadata strings from terminal JSON events."""
+    clean = text.strip()
+    if not clean or looks_like_prompt_echo(clean):
+        return False
+    lower = clean.lower()
+    if lower in {
+        "assistant",
+        "user",
+        "system",
+        "tool",
+        "text",
+        "step-start",
+        "step-finish",
+        "tool-calls",
+        "completed",
+        "running",
+        "pending",
+        "build",
+        "primary",
+    }:
+        return False
+    if re.fullmatch(r"(msg|prt|ses|toolu|call)_[A-Za-z0-9_-]+", clean):
+        return False
+    if re.fullmatch(r"[A-Za-z0-9_-]{18,}", clean) and not any(ch.isspace() for ch in clean):
+        return False
+    return True
+
+
+def append_terminal_event_text(value: Any, blocks: list[str], inherited_role: str | None = None) -> None:
+    """Extract readable text from a single opencode run JSON event."""
+    ignored_roles = {"user", "system"}
+    if isinstance(value, dict):
+        role_value = value.get("role") or value.get("speaker")
+        role = str(role_value).strip().lower() if isinstance(role_value, str) else inherited_role
+        for key in ("text", "content", "message", "output", "result", "delta", "error"):
+            item = value.get(key)
+            if isinstance(item, str) and role not in ignored_roles and should_keep_event_text(item):
+                blocks.append(item.strip())
+        for item in value.values():
+            append_terminal_event_text(item, blocks, role)
+    elif isinstance(value, list):
+        for item in value:
+            append_terminal_event_text(item, blocks, inherited_role)
+
+
+def parse_terminal_event(raw: str, config: BridgeConfig) -> tuple[str, str]:
+    """Parse one opencode run output line into session id and readable text."""
+    clean = sanitize_log_text(raw.strip(), config)
+    if not clean:
+        return "", ""
+    try:
+        event = json.loads(clean)
+    except json.JSONDecodeError:
+        return "", clean
+    blocks: list[str] = []
+    append_terminal_event_text(event, blocks)
+    return extract_session_id(event), "\n".join(dedupe_preserve_order(blocks))
+
+
+def dedupe_preserve_order(values: list[str]) -> list[str]:
+    """Deduplicate strings without reordering."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
+
+
+def run_opencode_terminal(config: BridgeConfig) -> str:
+    """Run OpenCode as a pure terminal command and stream readable JSON events."""
+    workspace = WORKSPACE_DIR
+    workspace.mkdir(parents=True, exist_ok=True)
+    runtime_tmp = Path("/workspace/.tmp")
+    runtime_tmp.mkdir(parents=True, exist_ok=True)
+    os.environ["TMPDIR"] = str(runtime_tmp)
+    prompt = build_continuation_prompt(config) if config.session_id else build_prompt(config)
+    args = [
+        "opencode",
+        "run",
+        "--format",
+        "json",
+        "--model",
+        f"{config.provider_id}/{config.model}",
+        "--title",
+        config.name,
+    ]
+    if config.session_id:
+        args.extend(["--session", config.session_id])
+    args.append(prompt)
+    log(
+        "Action: run OpenCode terminal "
+        f"model={config.provider_id}/{config.model} session={config.session_id or 'new'}"
+    )
+    process = subprocess.Popen(
+        args,
+        cwd=str(workspace),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=1,
+    )
+    blocks: list[str] = []
+    seen_session = config.session_id
+    last_preview = ""
+    assert process.stdout is not None
+    for raw_line in process.stdout:
+        session_id, text = parse_terminal_event(raw_line, config)
+        if session_id and session_id != seen_session:
+            seen_session = session_id
+            log(f"Observation: OpenCode session={session_id}")
+        if not text:
+            continue
+        if text != last_preview:
+            log_delta_preview(text)
+            last_preview = text
+        blocks.append(text)
+    exit_code = process.wait()
+    final_text = "\n\n".join(dedupe_preserve_order(blocks)).strip()
+    if exit_code != 0:
+        if final_text and (extract_marked_flag(final_text) or extract_flag_token(final_text)):
+            return final_text
+        raise RuntimeError(f"opencode run exited with status {exit_code}")
+    return final_text
+
+
+def sanitize_writeup_content(text: str, config: BridgeConfig) -> str:
+    """Normalize generated writeup text before emitting it through logs."""
+    text = sanitize_log_text(text, config)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace(WRITEUP_BEGIN_MARKER, "[removed writeup begin marker]")
+    text = text.replace(WRITEUP_END_MARKER, "[removed writeup end marker]")
+    text = text.strip()
+    if len(text) > MAX_WRITEUP_CHARS:
+        text = text[:MAX_WRITEUP_CHARS].rstrip()
+        text += "\n\n> WP内容超过平台限制，后续内容已截断。"
+    return text
+
+
+def build_fallback_writeup(config: BridgeConfig, final_text: str) -> str:
+    """Build a minimal Markdown writeup if OpenCode forgot to create the file."""
+    flag = extract_marked_flag(final_text) or extract_flag_token(final_text) or "未捕获"
+    excerpt = sanitize_writeup_content(final_text[-6000:], config) or "OpenCode没有输出可用的解题过程。"
+    return (
+        f"# {config.name}\n\n"
+        "## 题目概况\n\n"
+        f"- 题型:{config.category}\n"
+        f"- 目标:{config.target_ip or '未提供'}\n"
+        f"- Flag:{flag}\n\n"
+        "## 解题过程\n\n"
+        "OpenCode未按要求写入结构化WP文件，平台根据最终可读输出生成了兜底WP。\n\n"
+        "## 关键输出\n\n"
+        "```text\n"
+        f"{excerpt}\n"
+        "```\n\n"
+        "## 复现步骤\n\n"
+        "请参考上方关键输出中的命令、脚本和推导过程复现。\n"
+    )
+
+
+def read_or_create_writeup(config: BridgeConfig, final_text: str) -> str:
+    """Read OpenCode's generated writeup or create a fallback file."""
+    path = writeup_path(config)
+    try:
+        content = path.read_text(encoding="utf-8")
+    except OSError:
+        content = ""
+    content = sanitize_writeup_content(content, config)
+    if content:
+        return content
+    content = build_fallback_writeup(config, final_text)
+    try:
+        path.write_text(content + "\n", encoding="utf-8")
+    except OSError as exc:
+        log(f"Warning: failed to write fallback writeup {path.name}: {exc}")
+    return content
+
+
+def emit_writeup_output(config: BridgeConfig, final_text: str) -> None:
+    """Emit the generated writeup in a stable block for the Go backend."""
+    content = read_or_create_writeup(config, final_text)
+    log(f"Observation: OpenCode writeup file: {writeup_filename(config)}")
+    log(WRITEUP_BEGIN_MARKER)
+    log(content)
+    log(WRITEUP_END_MARKER)
+
+
+def emit_final_output(config: BridgeConfig, final_text: str) -> None:
+    """Print the final readable output and the marker-based capture block."""
+    emit_writeup_output(config, final_text)
+    log("Observation: final readable OpenCode output:")
+    log(final_text[-12000:])
+    final_line = extract_marked_flag(final_text) or extract_flag_token(final_text)
+    if final_line:
+        log(SOLVED_FLAG_MARKER)
+        log(final_line)
 
 
 def run_bridge() -> int:
@@ -465,23 +627,12 @@ def run_bridge() -> int:
     config = read_config()
     log("\x1b[36m[agent] Phase 5 OpenCode bridge started\x1b[0m")
     log(f"Thought: challenge={config.name!r} category={config.category!r}")
-    log("Action: start opencode web on 0.0.0.0:4096")
-    process: subprocess.Popen[str] | None = None
-
     try:
         configure_opencode(config)
-        process = start_server()
-        wait_for_server(config, process)
-        log("Observation: OpenCode Web is ready.")
-        session_id = create_session(config)
-        log(f"Observation: OpenCode session={session_id}")
-        send_prompt(config, session_id, build_prompt(config))
-        final_text = wait_for_session_text(config, session_id)
-        if final_text:
-            log("Observation: final readable OpenCode output:")
-            log(final_text[-12000:])
-        else:
-            raise RuntimeError("OpenCode finished without readable assistant output")
+        final_text = run_opencode_terminal(config)
+        if not final_text:
+            raise RuntimeError("OpenCode terminal finished without readable output")
+        emit_final_output(config, final_text)
     except Exception as exc:
         log(f"Final: opencode bridge failed: {exc}")
         return 1

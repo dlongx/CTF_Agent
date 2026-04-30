@@ -5,7 +5,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{.title}}</title>
-  <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="/static/app.css?v=terminal-20260430-detail">
 </head>
 <body>
   <main class="shell detail-shell" data-task-id="{{.taskID}}" data-not-found="{{.notFound}}">
@@ -44,15 +44,6 @@
         </dl>
         <h2>题目描述</h2>
         <pre id="task-description" class="description-box">加载中</pre>
-        <div class="hint-panel" id="hint-panel" hidden>
-          <h2>继续解题提示</h2>
-          <textarea id="hint-input" rows="4" placeholder="输入新的思路、约束或提示，让保留容器继续尝试"></textarea>
-          <div class="hint-actions">
-            <button id="send-hint">继续解题</button>
-            <a class="button-link secondary" href="/containers">去Docker管理</a>
-          </div>
-          <p class="muted" id="hint-status"></p>
-        </div>
       </aside>
 
       <section class="log-view">
@@ -65,10 +56,21 @@
           </div>
         </div>
         <pre id="logs" class="terminal">点击“查看日志”后显示logs.txt内容。</pre>
+        <div class="terminal-message-panel" id="message-panel">
+          <div class="terminal-message-head">
+            <label for="message-input">与OpenCode交流</label>
+            <span class="muted" id="message-state">加载中</span>
+          </div>
+          <textarea id="message-input" rows="3" placeholder="当前回合结束后，可以在这里补充新的思路、约束或提示"></textarea>
+          <div class="terminal-message-actions">
+            <button id="send-message">发送消息</button>
+            <p class="muted" id="message-status"></p>
+          </div>
+        </div>
       </section>
     </section>
   </main>
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=terminal-20260430"></script>
 </body>
 </html>
 {{end}}

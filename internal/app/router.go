@@ -37,14 +37,14 @@ func NewRouter(service *Service) *gin.Engine {
 	router.OPTIONS("/api/settings/provider", optionsHandler)
 	router.GET("/api/tasks/:id", service.taskDetail)
 	router.GET("/api/tasks/:id/logs", service.taskLogs)
-	router.GET("/api/tasks/:id/opencode", service.taskOpenCode)
 	router.GET("/api/tasks/:id/writeup", service.taskWriteup)
+	router.POST("/api/tasks/:id/messages", service.taskMessage)
 	router.POST("/api/tasks/:id/hints", service.taskHint)
 	router.POST("/api/tasks/:id/container/close", service.taskCloseContainer)
 	router.OPTIONS("/api/tasks/:id", optionsHandler)
 	router.OPTIONS("/api/tasks/:id/logs", optionsHandler)
-	router.OPTIONS("/api/tasks/:id/opencode", optionsHandler)
 	router.OPTIONS("/api/tasks/:id/writeup", optionsHandler)
+	router.OPTIONS("/api/tasks/:id/messages", optionsHandler)
 	router.OPTIONS("/api/tasks/:id/hints", optionsHandler)
 	router.OPTIONS("/api/tasks/:id/container/close", optionsHandler)
 	router.GET("/ws/tasks/:id/logs", func(c *gin.Context) {
@@ -246,23 +246,6 @@ func (s *Service) taskLogs(c *gin.Context) {
 	c.JSON(200, gin.H{"task_id": id, "logs": logs})
 }
 
-func (s *Service) taskOpenCode(c *gin.Context) {
-	task, ok := s.store.Get(c.Param("id"))
-	if !ok {
-		c.JSON(404, gin.H{"detail": "task not found"})
-		return
-	}
-	if task.OpenCodeWebURL == "" || (task.Status != StatusRunning && !task.ContainerKept) {
-		c.JSON(404, gin.H{"detail": "opencode web is not available for this task"})
-		return
-	}
-	c.JSON(200, gin.H{
-		"task_id":   task.ID,
-		"url":       task.OpenCodeWebURL,
-		"host_port": task.OpenCodeHostPort,
-	})
-}
-
 func (s *Service) taskWriteup(c *gin.Context) {
 	path, filename, ok := s.store.WriteupPath(c.Param("id"))
 	if !ok {
@@ -280,16 +263,42 @@ func (s *Service) taskHint(c *gin.Context) {
 		c.JSON(400, gin.H{"detail": "invalid hint payload"})
 		return
 	}
-	if err := s.ContinueTask(c.Param("id"), payload.Hint); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			c.JSON(404, gin.H{"detail": "task not found"})
-			return
-		}
-		c.JSON(400, gin.H{"detail": err.Error()})
+	if !s.handleTaskMessage(c, payload.Hint) {
 		return
 	}
 	task, _ := s.store.Get(c.Param("id"))
 	c.JSON(202, newTaskResponse(task))
+}
+
+func (s *Service) taskMessage(c *gin.Context) {
+	var payload struct {
+		Message string `json:"message"`
+	}
+	if err := c.ShouldBindJSON(&payload); err != nil {
+		c.JSON(400, gin.H{"detail": "invalid message payload"})
+		return
+	}
+	if !s.handleTaskMessage(c, payload.Message) {
+		return
+	}
+	task, _ := s.store.Get(c.Param("id"))
+	c.JSON(202, newTaskResponse(task))
+}
+
+func (s *Service) handleTaskMessage(c *gin.Context, message string) bool {
+	if err := s.SendTaskMessage(c.Param("id"), message); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			c.JSON(404, gin.H{"detail": "task not found"})
+			return false
+		}
+		if errors.Is(err, errTaskMessageBusy) {
+			c.JSON(http.StatusConflict, gin.H{"detail": err.Error()})
+			return false
+		}
+		c.JSON(400, gin.H{"detail": err.Error()})
+		return false
+	}
+	return true
 }
 
 func (s *Service) taskCloseContainer(c *gin.Context) {

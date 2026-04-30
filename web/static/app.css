@@ -556,25 +556,42 @@ button:disabled {
 
 .detail-shell {
   width: min(1440px, calc(100% - 32px));
-  overflow: auto;
+  height: 100dvh;
+  max-height: 100dvh;
+  overflow: hidden;
 }
 
 .detail-grid {
   display: grid;
   grid-template-columns: 340px minmax(0, 1fr);
   gap: 16px;
-  min-height: calc(100vh - 140px);
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .task-info,
 .log-view {
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
   padding: 16px;
+}
+
+.task-info {
+  display: flex;
+  flex-direction: column;
+}
+
+.task-info dl {
+  flex: 0 1 auto;
+  min-height: 0;
+  overflow: auto;
 }
 
 .log-view {
   display: flex;
   flex-direction: column;
-  min-width: 0;
 }
 
 dl {
@@ -594,32 +611,21 @@ dd {
 }
 
 .description-box {
+  flex: 1 1 auto;
+  margin: 8px 0 0;
+  min-height: 120px;
+  overflow: auto;
   white-space: pre-wrap;
   color: var(--text);
   background: #f8fafc;
   border: 1px solid var(--line);
   border-radius: 6px;
   padding: 12px;
-  min-height: 160px;
-}
-
-.hint-panel {
-  margin-top: 16px;
-}
-
-.hint-panel textarea {
-  margin-top: 10px;
-}
-
-.hint-actions {
-  display: flex;
-  gap: 8px;
-  margin-top: 10px;
 }
 
 .terminal {
-  height: calc(100vh - 230px);
-  min-height: 420px;
+  height: auto;
+  min-height: 0;
   margin: 14px 0 0;
   padding: 14px;
   overflow: auto;
@@ -629,6 +635,43 @@ dd {
   font: 13px/1.5 Consolas, "Cascadia Mono", "SFMono-Regular", monospace;
   white-space: pre-wrap;
   flex: 1 1 auto;
+}
+
+.terminal-message-panel {
+  flex: 0 0 auto;
+  margin-top: 12px;
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+
+.terminal-message-head,
+.terminal-message-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.terminal-message-head label {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.terminal-message-panel textarea {
+  margin-top: 8px;
+  min-height: 64px;
+  max-height: 96px;
+  resize: none;
+}
+
+.terminal-message-actions {
+  justify-content: flex-start;
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+
+.terminal-message-actions .muted {
+  margin: 0;
 }
 
 @media (max-width: 760px) {
@@ -642,10 +685,27 @@ dd {
     overflow: visible;
   }
 
+  .detail-shell {
+    height: 100dvh;
+    min-height: 0;
+    overflow: hidden;
+  }
+
   .workspace-grid,
   .detail-grid {
     grid-template-columns: 1fr;
     overflow: visible;
+  }
+
+  .detail-grid {
+    grid-template-rows: minmax(150px, 34%) minmax(0, 1fr);
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .detail-shell .task-info,
+  .detail-shell .log-view {
+    overflow: hidden;
   }
 
   .tasks-panel,
@@ -691,7 +751,18 @@ dd {
   }
 
   .terminal {
-    height: 58vh;
+    height: auto;
+    min-height: 0;
+  }
+
+  .terminal-message-head,
+  .terminal-message-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .terminal-message-actions button {
+    width: 100%;
   }
 }
 

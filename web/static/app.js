@@ -293,35 +293,39 @@ async function loadTaskDetail() {
     ? `${task.container_name} 已保留`
     : (task.status === 'running' && task.container_name ? `${task.container_name} 运行中` : '未保留');
   updateOpenCodePanel(task);
+  updateTerminalMessagePanel(task);
   $('#task-description').textContent = text(task.description, '');
-  const hintPanel = $('#hint-panel');
-  if (hintPanel) {
-    hintPanel.hidden = !task.container_kept;
-  }
 }
 
 function updateOpenCodePanel(task) {
   const field = $('#task-opencode');
-  const hasEndpoint = Boolean(task.opencode_available && task.opencode_web_url);
-  const safeURL = hasEndpoint ? safeHTTPURL(task.opencode_web_url) : '';
-  const status = task.opencode_status || (hasEndpoint ? 'starting' : 'unavailable');
+  const status = task.opencode_status || 'unavailable';
   const message = task.opencode_message || '';
-  const hasSession = Boolean(safeURL && task.opencode_session);
   if (field) {
     if (status === 'error') {
       field.innerHTML = `<span class="inline-error">OpenCode服务错误：${escapeHTML(message || '启动失败')}</span>`;
       return;
     }
-    if (hasSession) {
-      field.innerHTML = `<a class="button-link compact" href="${escapeHTML(safeURL)}" target="_blank" rel="noopener">打开当前会话</a>`;
-      return;
-    }
-    if (status === 'starting' || safeURL) {
-      field.textContent = message || '等待OpenCode会话初始化';
-      return;
-    }
-    field.textContent = message || '不可用';
+    field.textContent = message || 'OpenCode终端不可用';
   }
+}
+
+function updateTerminalMessagePanel(task) {
+  const panel = $('#message-panel');
+  const input = $('#message-input');
+  const button = $('#send-message');
+  const state = $('#message-state');
+  if (!panel || !input || !button || !state) return;
+  const canSend = Boolean(task.can_send_message);
+  panel.hidden = false;
+  input.disabled = !canSend;
+  button.disabled = !canSend;
+  state.textContent = task.terminal_message_status || (canSend ? '可以继续发送' : '当前不可发送');
+  input.placeholder = canSend
+    ? '输入新的思路、约束或提示，发送后会继续同一个OpenCode终端会话'
+    : (task.terminal_message_status || '当前不可发送消息');
+  const messageStatus = $('#message-status');
+  if (messageStatus && canSend) messageStatus.textContent = '';
 }
 
 async function loadLogs() {
@@ -366,18 +370,6 @@ function escapeHTML(value) {
   }[char]));
 }
 
-function safeHTTPURL(value) {
-  try {
-    const url = new URL(String(value), window.location.origin);
-    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-      return '';
-    }
-    return url.href;
-  } catch {
-    return '';
-  }
-}
-
 async function copyFlag(event) {
   const button = event.currentTarget;
   const flag = button.dataset.flag || '';
@@ -419,28 +411,33 @@ function confirmCloseContainer(name) {
   return window.confirm(`确认销毁${name}的容器吗？销毁后只能保留日志、已解出的WP和附件，不能继续这个运行现场。`);
 }
 
-async function sendHint() {
+async function sendMessage() {
   const shell = $('.detail-shell');
-  const input = $('#hint-input');
-  const status = $('#hint-status');
+  const input = $('#message-input');
+  const status = $('#message-status');
   if (!shell || !input || !status) return;
-  const hint = input.value.trim();
-  if (!hint) {
-    status.textContent = '请输入提示内容';
+  const message = input.value.trim();
+  if (!message) {
+    status.textContent = '请输入消息内容';
     return;
   }
-  status.textContent = '已提交，正在继续解题';
+  const button = $('#send-message');
+  if (button) button.disabled = true;
+  status.textContent = '已提交，正在继续OpenCode终端会话';
   try {
-    await fetchJSON(`/api/tasks/${encodeURIComponent(shell.dataset.taskId)}/hints`, {
+    await fetchJSON(`/api/tasks/${encodeURIComponent(shell.dataset.taskId)}/messages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ hint }),
+      body: JSON.stringify({ message }),
     });
     input.value = '';
     await loadTaskDetail();
     await followLogs();
   } catch (error) {
     status.textContent = error.message;
+  } finally {
+    if (button) button.disabled = false;
+    await loadTaskDetail().catch(() => {});
   }
 }
 
@@ -569,7 +566,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const logs = $('#logs');
     if (logs) logs.textContent = '';
   });
-  $('#send-hint')?.addEventListener('click', sendHint);
+  $('#send-message')?.addEventListener('click', sendMessage);
   loadCards().catch((error) => {
     const cards = $('#task-cards');
     if (cards) cards.innerHTML = `<p class="muted">${escapeHTML(error.message)}</p>`;

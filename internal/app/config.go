@@ -1,7 +1,6 @@
 package app
 
 import (
-	"encoding/base64"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -29,10 +28,6 @@ type Config struct {
 	OpenCodeBaseURL        string
 	OpenCodeAPIKey         string
 	OpenCodeModel          string
-	OpenCodeWebEnabled     bool
-	OpenCodeWebBindIP      string
-	OpenCodeWebPublicBase  string
-	OpenCodeServerPassword string
 }
 
 const (
@@ -56,6 +51,7 @@ func LoadConfig() Config {
 	if err != nil {
 		root = "."
 	}
+	loadLocalEnvFile(filepath.Join(root, "opencode.env"))
 	dataDir := absPath(root, getenv("CTF_AGENT_DATA_DIR", "data"))
 	defaultImage := getenv("CTF_AGENT_DOCKER_IMAGE", "ctf-agent-opencode:latest")
 	providers := loadOpenCodeProviders()
@@ -82,10 +78,40 @@ func LoadConfig() Config {
 		OpenCodeBaseURL:        activeProvider.BaseURL,
 		OpenCodeAPIKey:         activeProvider.APIKey,
 		OpenCodeModel:          activeProvider.Model,
-		OpenCodeWebEnabled:     getenvBool("CTF_AGENT_OPENCODE_WEB_ENABLED", true),
-		OpenCodeWebBindIP:      getenv("CTF_AGENT_OPENCODE_BIND_IP", "127.0.0.1"),
-		OpenCodeWebPublicBase:  getenv("CTF_AGENT_OPENCODE_PUBLIC_BASE_URL", "http://127.0.0.1"),
-		OpenCodeServerPassword: strings.TrimSpace(os.Getenv("OPENCODE_SERVER_PASSWORD")),
+	}
+}
+
+func loadLocalEnvFile(path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	lines := strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n")
+	for _, raw := range lines {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		if key == "" || strings.ContainsAny(key, " \t") {
+			continue
+		}
+		if strings.TrimSpace(os.Getenv(key)) != "" {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if len(value) >= 2 {
+			first := value[0]
+			last := value[len(value)-1]
+			if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+				value = value[1 : len(value)-1]
+			}
+		}
+		_ = os.Setenv(key, value)
 	}
 }
 
@@ -201,31 +227,6 @@ func canonicalProviderFormat(format string) (string, bool) {
 	default:
 		return "", false
 	}
-}
-
-func (c Config) OpenCodeWebURL(hostPort string) string {
-	hostPort = strings.TrimSpace(hostPort)
-	if hostPort == "" {
-		return ""
-	}
-	base := strings.TrimRight(strings.TrimSpace(c.OpenCodeWebPublicBase), "/")
-	if base == "" {
-		base = "http://127.0.0.1"
-	}
-	if !strings.Contains(base, "://") {
-		base = "http://" + base
-	}
-	return base + ":" + hostPort
-}
-
-func (c Config) OpenCodeSessionURL(hostPort string, sessionID string) string {
-	base := c.OpenCodeWebURL(hostPort)
-	sessionID = strings.TrimSpace(sessionID)
-	if base == "" || sessionID == "" {
-		return base
-	}
-	workspaceSlug := base64.RawURLEncoding.EncodeToString([]byte("/workspace"))
-	return base + "/" + workspaceSlug + "/session/" + sessionID
 }
 
 func getenv(name string, fallback string) string {

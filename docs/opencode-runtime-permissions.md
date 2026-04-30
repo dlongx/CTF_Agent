@@ -20,9 +20,8 @@ Gin+HTML前端
   -> Go API/SSE/WebSocket
     -> Docker任务容器
       -> runtime/opencode/bridge.py
-        -> opencode web
-          -> OpenCode会话
-            -> 模型网关
+        -> opencode run --format json
+          -> 模型网关
 ```
 
 Go后端负责控制面：
@@ -36,8 +35,8 @@ Docker资源限制
 日志文件持久化
 WebSocket日志推送
 SSE任务状态事件
-OpenCode会话URL持久化
-最终输出最后一行Flag提取
+OpenCode终端session持久化
+中文标记下一行Flag提取
 ```
 
 OpenCode负责容器内执行面：
@@ -123,8 +122,6 @@ Agent脚本只读挂载
 cap-drop=ALL
 security-opt=no-new-privileges:true
 按需决定是否允许网络
-OpenCodeWeb默认只绑定127.0.0.1
-共享服务器设置OPENCODE_SERVER_PASSWORD
 ```
 
 当前项目的Docker启动策略已经覆盖大部分边界：
@@ -151,8 +148,8 @@ OpenCodeWeb默认只绑定127.0.0.1
 ```text
 OpenCode permission:allow
 Docker网络:按题目需要开启
-OpenCodeWeb:127.0.0.1
-容器失败后保留，支持继续提示
+OpenCode执行:opencode run --format json
+容器失败后保留，支持在终端下方继续发送消息
 成功出Flag后自动关闭容器
 ```
 
@@ -164,16 +161,13 @@ OpenCodeWeb:127.0.0.1
 
 ```text
 OpenCode permission:allow
-OpenCodeWeb设置密码
-反向代理增加认证
+前端和API放在受控网络或反向代理认证后
 限制每用户并发数
 限制容器网络出口
 记录容器stdout/stderr和任务元数据
 失败容器设置保留时间上限
 定期清理孤儿容器和旧任务
 ```
-
-这时不要把OpenCodeWeb直接裸露到公网。
 
 ### 高风险比赛环境
 
@@ -195,7 +189,7 @@ Docker网络默认关闭
 使用--privileged运行题目容器
 把项目根目录以可写方式挂进容器
 把opencode.env或真实API Key挂进容器文件系统
-让OpenCodeWeb无密码暴露到公网
+把真实模型Key写入Docker镜像
 成功解题后永久保留容器
 为了方便调试取消CPU/内存/进程限制
 ```
@@ -207,28 +201,30 @@ Docker网络默认关闭
 权限策略不负责判断Flag。当前平台只使用一条主规则：
 
 ```text
-OpenCode最终可读输出的最后一个非空行=Flag
+精确匹配一行“这道题目已经解出”，捕获下一条非空、非平台日志行作为Flag
 ```
 
-`runtime/opencode/bridge.py`会要求OpenCode最终回复的最后一行只包含Flag本身。Go后端只从`Observation: final readable OpenCode output:`块中读取最后一个非空行；如果没有这个块，则不判定Flag。
-
-## 超时和输出导出
-
-OpenCode自身的模型请求可能比外层任务调度更久。如果Go调度层先超时，桥接脚本就没有机会执行：
+`runtime/opencode/bridge.py`会要求OpenCode解出后按以下两行收尾：
 
 ```text
-导出OpenCode会话
-提取final readable OpenCode output
-写入Flag和WP
+这道题目已经解出
+<exact flag>
 ```
 
-因此当前项目要求：
+Go后端会优先按这个中文标记捕获Flag，并保留旧final readable output最后一行和`flag{}`正则作为历史兼容兜底。
+
+## 终端事件流
+
+OpenCode通过`opencode run --format json`输出JSON事件流。桥接脚本会递归提取：
 
 ```text
-CTF_AGENT_TASK_TIMEOUT >= OPENCODE_TIMEOUT_SECONDS + 60
+OpenCodesessionID
+assistant可读文本
+工具输出
+最终中文Flag标记块
 ```
 
-Go后端会自动做这个下限保护。失败或超时任务不会立即删除容器，用户可以继续打开OpenCode会话查看过程，或者在详情页补充提示后继续解题。
+Go调度层不设置解题总时长超时。失败任务不会立即删除容器，用户可以在详情页终端下方补充消息，继续同一个OpenCodesession。
 
 ## 当前验证步骤
 
@@ -236,7 +232,7 @@ Go后端会自动做这个下限保护。失败或超时任务不会立即删除
 1.保留Docker所有资源和安全限制
 2.本地烟测一题，确认不再出现permission asking日志
 3.测试需要外部目录/重复命令/脚本写入的题目
-4.服务器部署前配置OpenCodeWeb密码和反向代理认证
+4.确认任务日志里没有旧Web链路、4096端口映射或export session旧链路输出
 ```
 
 ## 相关文件
