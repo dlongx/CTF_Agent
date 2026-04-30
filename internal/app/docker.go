@@ -15,17 +15,9 @@ import (
 type LogSink func(string)
 
 type DockerResult struct {
-	ExitCode         int
-	ContainerName    string
-	Retained         bool
-	OpenCodeHostPort string
-	OpenCodeWebURL   string
-}
-
-type DockerEndpoint struct {
-	ContainerName    string
-	OpenCodeHostPort string
-	OpenCodeWebURL   string
+	ExitCode      int
+	ContainerName string
+	Retained      bool
 }
 
 type DockerContainer struct {
@@ -78,7 +70,7 @@ func ListDockerContainers() (map[string]DockerContainer, error) {
 	return containers, nil
 }
 
-func RunDockerTask(cfg Config, task *Task, logSink LogSink, endpointSink func(DockerEndpoint)) (DockerResult, error) {
+func RunDockerTask(cfg Config, task *Task, logSink LogSink, containerSink func(string)) (DockerResult, error) {
 	if cfg.AgentScript == "" {
 		return DockerResult{ExitCode: 2}, errors.New("CTF_AGENT_AGENT_SCRIPT is empty")
 	}
@@ -100,9 +92,6 @@ func RunDockerTask(cfg Config, task *Task, logSink LogSink, endpointSink func(Do
 		"--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
 		"-w", "/workspace",
 	}
-	if cfg.OpenCodeWebEnabled && !cfg.DisableNetwork {
-		args = append(args, "-p", cfg.OpenCodeWebBindIP+"::4096")
-	}
 	args = append(args,
 		"-v", dockerMount(cfg.AgentScript)+":/opt/ctf_agent/agent.py:ro",
 		"-v", dockerMount(cfg.SkillsDir)+":/skills:ro",
@@ -116,12 +105,6 @@ func RunDockerTask(cfg Config, task *Task, logSink LogSink, endpointSink func(Do
 		"-e", "CTF_AGENT_SKILL_IDS="+normalizeCategory(task.Category),
 		"-e", "PYTHONUNBUFFERED=1",
 	)
-	for _, item := range openCodeProviderEnv(cfg) {
-		args = append(args, "-e", item)
-	}
-	if cfg.OpenCodeServerPassword != "" {
-		args = append(args, "-e", "OPENCODE_SERVER_PASSWORD="+cfg.OpenCodeServerPassword)
-	}
 	if cfg.DisableNetwork {
 		args = append(args, "--network", "none")
 	}
@@ -133,14 +116,11 @@ func RunDockerTask(cfg Config, task *Task, logSink LogSink, endpointSink func(Do
 		return DockerResult{ExitCode: 2, ContainerName: containerName}, errors.New(string(output))
 	}
 	logSink("[runner] container_name=" + containerName + "\n")
-	endpoint := inspectOpenCodeEndpoint(cfg, containerName, logSink)
-	if endpointSink != nil {
-		endpointSink(endpoint)
+	if containerSink != nil {
+		containerSink(containerName)
 	}
-	result, err := runAgentInContainer(ctx, containerName, nil, logSink)
+	result, err := runAgentInContainer(ctx, containerName, openCodeProviderEnv(cfg), logSink)
 	result.ContainerName = containerName
-	result.OpenCodeHostPort = endpoint.OpenCodeHostPort
-	result.OpenCodeWebURL = endpoint.OpenCodeWebURL
 	if err != nil {
 		return result, err
 	}
@@ -163,6 +143,9 @@ func RunDockerHint(cfg Config, task *Task, hint string, logSink LogSink) (Docker
 	ctx := context.Background()
 	logSink("[runner] continuing retained container_name=" + task.ContainerName + "\n")
 	env := append(openCodeProviderEnv(cfg), "CTF_AGENT_USER_HINT="+hint)
+	if task.OpenCodeSession != "" {
+		env = append(env, "OPENCODE_SESSION_ID="+task.OpenCodeSession)
+	}
 	result, err := runAgentInContainer(ctx, task.ContainerName, env, logSink)
 	if err != nil {
 		return result, err
@@ -242,41 +225,6 @@ func runAgentInContainer(ctx context.Context, containerName string, env []string
 	}
 	logSink("[runner] agent exited with status=0\n")
 	return DockerResult{ExitCode: 0, ContainerName: containerName}, nil
-}
-
-func inspectOpenCodeEndpoint(cfg Config, containerName string, logSink LogSink) DockerEndpoint {
-	endpoint := DockerEndpoint{ContainerName: containerName}
-	if !cfg.OpenCodeWebEnabled || cfg.DisableNetwork {
-		return endpoint
-	}
-	output, err := exec.Command("docker", "port", containerName, "4096/tcp").CombinedOutput()
-	if err != nil {
-		logSink("[runner] opencode web port inspect failed: " + strings.TrimSpace(string(output)) + "\n")
-		return endpoint
-	}
-	hostPort := parseDockerHostPort(string(output))
-	if hostPort == "" {
-		logSink("[runner] opencode web port was not published\n")
-		return endpoint
-	}
-	endpoint.OpenCodeHostPort = hostPort
-	endpoint.OpenCodeWebURL = cfg.OpenCodeWebURL(hostPort)
-	logSink("[runner] opencode web url=" + endpoint.OpenCodeWebURL + "\n")
-	return endpoint
-}
-
-func parseDockerHostPort(output string) string {
-	lines := strings.Split(strings.TrimSpace(output), "\n")
-	for i := len(lines) - 1; i >= 0; i-- {
-		line := strings.TrimSpace(lines[i])
-		if line == "" {
-			continue
-		}
-		if index := strings.LastIndex(line, ":"); index >= 0 && index+1 < len(line) {
-			return strings.TrimSpace(line[index+1:])
-		}
-	}
-	return ""
 }
 
 func streamPipe(wg *sync.WaitGroup, reader io.Reader, logSink LogSink) {

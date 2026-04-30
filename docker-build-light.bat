@@ -46,6 +46,10 @@ if /I "%TARGET%"=="opencode" (
     call :build_image ctf-agent-opencode:latest "%ROOT%\docker\opencode-agent" || goto :failed
     goto :success
 )
+if /I "%TARGET%"=="verify" (
+    call :verify_images || goto :failed
+    goto :success
+)
 
 call :ensure_opencode || goto :failed
 
@@ -120,6 +124,56 @@ echo Build finished successfully: %DATE% %TIME%>>"%LOG%"
 endlocal
 exit /b 0
 
+:verify_images
+call :verify_image ctf-agent-base:latest "requests,bs4,cryptography,lxml,pwn,Crypto,z3,httpx,dns.resolver,numpy,PIL,scapy,sympy,magic" || exit /b 1
+call :verify_commands ctf-agent-base:latest "bash curl wget unzip 7z xz file rg python gcc g++ make cmake clang lldb gdb gdbserver strace ltrace nc socat nmap tcpdump tmux jq" || exit /b 1
+call :verify_image ctf-agent-opencode:latest "requests,bs4,cryptography,lxml,pwn,Crypto,z3,httpx,dns.resolver,numpy,PIL,scapy,sympy,magic" || exit /b 1
+call :verify_image ctf-agent-web:latest "jwt,jose,flask_unsign,websockets,aiohttp,requests_toolbelt,websocket" || exit /b 1
+call :verify_commands ctf-agent-web:latest "sqlmap dirb gobuster nikto whatweb wafw00f mitmproxy tshark whois go" || exit /b 1
+call :verify_image ctf-agent-misc:latest "pyzbar,qrcode,dnslib,pymodbus,stegpy" || exit /b 1
+call :verify_commands ctf-agent-misc:latest "ffmpeg sox zbarimg qrencode exiftool pngcheck steghide outguess tshark 7z unrar-free" || exit /b 1
+call :verify_image ctf-agent-crypto:latest "gmpy2,fpylll,ecdsa,py_ecc,libnum,owiener,primefac" || exit /b 1
+call :verify_commands ctf-agent-crypto:latest "openssl john hashcat gp" || exit /b 1
+call :verify_image ctf-agent-pwn:latest "pwn,capstone,keystone,unicorn,ropper,LibcSearcher" || exit /b 1
+call :verify_commands ctf-agent-pwn:latest "checksec gdb gdb-multiarch gdbserver strace ltrace file readelf objdump eu-readelf xxd nc socat nmap patchelf qemu-x86_64 qemu-system-x86_64 cpio busybox" || exit /b 1
+call :verify_image ctf-agent-reverse:latest "angr,lief,qiling,frida_tools,capstone,unicorn,androguard,angrop,objection,r2pipe" || exit /b 1
+call :verify_commands ctf-agent-reverse:latest "apktool jadx adb fastboot aapt apksigner zipalign gcc g++ aarch64-linux-gnu-gcc readelf objdump eu-readelf file xxd unzip zip upx" || exit /b 1
+call :verify_image ctf-agent-forensics:latest "volatility3,construct,pyshark,hachoir,oletools,stegpy" || exit /b 1
+call :verify_commands ctf-agent-forensics:latest "binwalk foremost exiftool pngcheck zbarimg qrencode steghide outguess ffmpeg sox convert 7z unrar-free john tshark tcpdump pcapfix pdfinfo fls zsteg" || exit /b 1
+exit /b 0
+
+:verify_image
+set "IMAGE=%~1"
+set "MODULES=%~2"
+echo [verify] %IMAGE%
+echo.>>"%LOG%"
+echo [verify] %IMAGE%>>"%LOG%"
+docker run --rm "%IMAGE%" python -c "import importlib; mods='%MODULES%'.split(','); [importlib.import_module(m) for m in mods if m]; print('ok')" >>"%LOG%" 2>&1
+if errorlevel 1 (
+    echo [failed] %IMAGE%
+    echo [failed] %IMAGE%>>"%LOG%"
+    exit /b 1
+)
+echo [ok] %IMAGE%
+echo [ok] %IMAGE%>>"%LOG%"
+exit /b 0
+
+:verify_commands
+set "IMAGE=%~1"
+set "COMMANDS=%~2"
+echo [verify commands] %IMAGE%
+echo.>>"%LOG%"
+echo [verify commands] %IMAGE%>>"%LOG%"
+docker run --rm "%IMAGE%" sh -lc "for cmd in %COMMANDS%; do command -v $cmd >/dev/null || exit 1; done; echo ok" >>"%LOG%" 2>&1
+if errorlevel 1 (
+    echo [failed] %IMAGE%
+    echo [failed] %IMAGE%>>"%LOG%"
+    exit /b 1
+)
+echo [ok] %IMAGE%
+echo [ok] %IMAGE%>>"%LOG%"
+exit /b 0
+
 :build_image
 set "IMAGE=%~1"
 set "CONTEXT=%~2"
@@ -144,13 +198,14 @@ goto :usage
 :usage
 echo.
 echo Usage:
-echo   docker-build-light.bat [all^|base^|opencode^|web^|pwn^|crypto^|reverse^|forensics^|misc] [--rebuild-base]
+echo   docker-build-light.bat [all^|base^|opencode^|web^|pwn^|crypto^|reverse^|forensics^|misc^|verify] [--rebuild-base]
 echo.
 echo Examples:
 echo   docker-build-light.bat crypto
 echo   docker-build-light.bat web
 echo   docker-build-light.bat all
 echo   docker-build-light.bat opencode --rebuild-base
+echo   docker-build-light.bat verify
 echo.
 endlocal
 exit /b 1

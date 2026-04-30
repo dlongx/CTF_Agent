@@ -145,10 +145,6 @@ func (s *Store) MarkFinished(id string, exitCode int, flag *string, lastStep str
 		task.LastStep = lastStep
 		task.ContainerName = containerName
 		task.ContainerKept = containerKept
-		if !containerKept {
-			task.OpenCodeHostPort = ""
-			task.OpenCodeWebURL = ""
-		}
 		if flag != nil {
 			task.Status = StatusSolved
 			task.Error = nil
@@ -164,13 +160,18 @@ func (s *Store) MarkFinished(id string, exitCode int, flag *string, lastStep str
 
 func (s *Store) MarkFlag(id string, flag string) error {
 	return s.update(id, func(task *Task) {
+		now := time.Now().UTC()
 		flag = strings.TrimSpace(flag)
 		task.Flag = &flag
 		task.Status = StatusSolved
 		task.Error = nil
+		if task.FinishedAt == nil {
+			task.FinishedAt = &now
+		}
+		if strings.TrimSpace(task.LastStep) == "" || task.LastStep == "任务正在执行" {
+			task.LastStep = "Flag已捕获"
+		}
 		task.ContainerKept = false
-		task.OpenCodeHostPort = ""
-		task.OpenCodeWebURL = ""
 	})
 }
 
@@ -183,9 +184,32 @@ func (s *Store) MarkInvalidFlag(id string, message string) error {
 		task.LastStep = message
 		task.FinishedAt = &now
 		task.ContainerKept = false
-		task.OpenCodeHostPort = ""
-		task.OpenCodeWebURL = ""
 	})
+}
+
+func (s *Store) MarkFalseLiveCapture(id string, message string) error {
+	if !isSafeTaskID(id) {
+		return errors.New("invalid task id")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	task, ok := s.tasks[id]
+	if !ok {
+		return errors.New("task not found")
+	}
+	if task.WriteupFileName != "" && isSafeStoredFilename(task.WriteupFileName) {
+		_ = os.Remove(filepath.Join(s.root, id, task.WriteupFileName))
+	}
+	now := time.Now().UTC()
+	task.Flag = nil
+	task.Status = StatusFailed
+	task.ExitCode = nil
+	task.Error = &message
+	task.LastStep = message
+	task.FinishedAt = &now
+	task.ContainerKept = true
+	task.WriteupFileName = ""
+	return s.writeTask(task)
 }
 
 func (s *Store) MarkFailed(id string, message string) error {
@@ -198,20 +222,15 @@ func (s *Store) MarkFailed(id string, message string) error {
 	})
 }
 
-func (s *Store) MarkRuntimeEndpoint(id string, containerName string, hostPort string, webURL string) error {
+func (s *Store) MarkRuntimeContainer(id string, containerName string) error {
 	return s.update(id, func(task *Task) {
 		task.ContainerName = containerName
-		task.OpenCodeHostPort = hostPort
-		task.OpenCodeWebURL = webURL
 	})
 }
 
-func (s *Store) MarkOpenCodeSession(id string, sessionID string, webURL string) error {
+func (s *Store) MarkOpenCodeSession(id string, sessionID string) error {
 	return s.update(id, func(task *Task) {
 		task.OpenCodeSession = strings.TrimSpace(sessionID)
-		if strings.TrimSpace(webURL) != "" {
-			task.OpenCodeWebURL = webURL
-		}
 	})
 }
 
@@ -252,8 +271,6 @@ func (s *Store) MarkContainerClosed(id string) error {
 		now := time.Now().UTC()
 		task.ContainerKept = false
 		task.ContainerName = ""
-		task.OpenCodeHostPort = ""
-		task.OpenCodeWebURL = ""
 		task.OpenCodeSession = ""
 		task.LastStep = containerClosedMessage
 		if task.Status == StatusRunning || task.Status == StatusQueued {
@@ -291,8 +308,6 @@ func (s *Store) MarkRecovered(id string) error {
 			task.Error = nil
 			task.ContainerKept = false
 			task.ContainerName = ""
-			task.OpenCodeHostPort = ""
-			task.OpenCodeWebURL = ""
 			task.OpenCodeSession = ""
 		}
 	})
@@ -366,8 +381,6 @@ func (s *Store) readTask(dir string, dirID string) (*Task, error) {
 		task.Status = StatusSolved
 		task.Error = nil
 		task.ContainerKept = false
-		task.OpenCodeHostPort = ""
-		task.OpenCodeWebURL = ""
 	}
 	return &task, nil
 }

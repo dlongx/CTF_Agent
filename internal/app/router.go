@@ -1,6 +1,7 @@
 package app
 
 import (
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"net/http"
@@ -16,15 +17,16 @@ import (
 func NewRouter(service *Service) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()
-	router.Use(gin.Logger(), gin.Recovery(), corsMiddleware())
+	router.Use(gin.Logger(), gin.Recovery(), corsMiddleware(service.cfg.AllowedOrigins))
 	webDir := findWebDir()
 	router.Static("/static", filepath.Join(webDir, "static"))
 	router.LoadHTMLGlob(filepath.Join(webDir, "templates", "*.html"))
 
+	router.GET("/health", healthHandler)
+	router.Use(authMiddleware(service.cfg.AccessToken))
 	router.GET("/", service.indexPage)
 	router.GET("/containers", service.containersPage)
 	router.GET("/tasks/:id", service.taskPage)
-	router.GET("/health", healthHandler)
 	router.GET("/api/events", service.taskEvents)
 	router.GET("/api/containers", service.listContainers)
 	router.GET("/api/settings/provider", service.providerSettings)
@@ -37,14 +39,14 @@ func NewRouter(service *Service) *gin.Engine {
 	router.OPTIONS("/api/settings/provider", optionsHandler)
 	router.GET("/api/tasks/:id", service.taskDetail)
 	router.GET("/api/tasks/:id/logs", service.taskLogs)
-	router.GET("/api/tasks/:id/opencode", service.taskOpenCode)
 	router.GET("/api/tasks/:id/writeup", service.taskWriteup)
+	router.POST("/api/tasks/:id/messages", service.taskMessage)
 	router.POST("/api/tasks/:id/hints", service.taskHint)
 	router.POST("/api/tasks/:id/container/close", service.taskCloseContainer)
 	router.OPTIONS("/api/tasks/:id", optionsHandler)
 	router.OPTIONS("/api/tasks/:id/logs", optionsHandler)
-	router.OPTIONS("/api/tasks/:id/opencode", optionsHandler)
 	router.OPTIONS("/api/tasks/:id/writeup", optionsHandler)
+	router.OPTIONS("/api/tasks/:id/messages", optionsHandler)
 	router.OPTIONS("/api/tasks/:id/hints", optionsHandler)
 	router.OPTIONS("/api/tasks/:id/container/close", optionsHandler)
 	router.GET("/ws/tasks/:id/logs", func(c *gin.Context) {
@@ -246,23 +248,6 @@ func (s *Service) taskLogs(c *gin.Context) {
 	c.JSON(200, gin.H{"task_id": id, "logs": logs})
 }
 
-func (s *Service) taskOpenCode(c *gin.Context) {
-	task, ok := s.store.Get(c.Param("id"))
-	if !ok {
-		c.JSON(404, gin.H{"detail": "task not found"})
-		return
-	}
-	if task.OpenCodeWebURL == "" || (task.Status != StatusRunning && !task.ContainerKept) {
-		c.JSON(404, gin.H{"detail": "opencode web is not available for this task"})
-		return
-	}
-	c.JSON(200, gin.H{
-		"task_id":   task.ID,
-		"url":       task.OpenCodeWebURL,
-		"host_port": task.OpenCodeHostPort,
-	})
-}
-
 func (s *Service) taskWriteup(c *gin.Context) {
 	path, filename, ok := s.store.WriteupPath(c.Param("id"))
 	if !ok {
@@ -280,16 +265,42 @@ func (s *Service) taskHint(c *gin.Context) {
 		c.JSON(400, gin.H{"detail": "invalid hint payload"})
 		return
 	}
-	if err := s.ContinueTask(c.Param("id"), payload.Hint); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			c.JSON(404, gin.H{"detail": "task not found"})
-			return
-		}
-		c.JSON(400, gin.H{"detail": err.Error()})
+	if !s.handleTaskMessage(c, payload.Hint) {
 		return
 	}
 	task, _ := s.store.Get(c.Param("id"))
 	c.JSON(202, newTaskResponse(task))
+}
+
+func (s *Service) taskMessage(c *gin.Context) {
+	var payload struct {
+		Message string `json:"message"`
+	}
+	if err := c.ShouldBindJSON(&payload); err != nil {
+		c.JSON(400, gin.H{"detail": "invalid message payload"})
+		return
+	}
+	if !s.handleTaskMessage(c, payload.Message) {
+		return
+	}
+	task, _ := s.store.Get(c.Param("id"))
+	c.JSON(202, newTaskResponse(task))
+}
+
+func (s *Service) handleTaskMessage(c *gin.Context, message string) bool {
+	if err := s.SendTaskMessage(c.Param("id"), message); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			c.JSON(404, gin.H{"detail": "task not found"})
+			return false
+		}
+		if errors.Is(err, errTaskMessageBusy) {
+			c.JSON(http.StatusConflict, gin.H{"detail": err.Error()})
+			return false
+		}
+		c.JSON(400, gin.H{"detail": err.Error()})
+		return false
+	}
+	return true
 }
 
 func (s *Service) taskCloseContainer(c *gin.Context) {
@@ -305,11 +316,56 @@ func (s *Service) taskCloseContainer(c *gin.Context) {
 	c.JSON(200, newTaskResponse(task))
 }
 
-func corsMiddleware() gin.HandlerFunc {
+func authMiddleware(token string) gin.HandlerFunc {
+	token = strings.TrimSpace(token)
 	return func(c *gin.Context) {
-		c.Header("Access-Control-Allow-Origin", "*")
+		if token == "" || c.Request.Method == http.MethodOptions || requestHasValidAccessToken(c.Request, token) {
+			c.Next()
+			return
+		}
+		c.Header("WWW-Authenticate", `Basic realm="CTF Agent"`)
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"detail": "authentication required"})
+	}
+}
+
+func requestHasValidAccessToken(req *http.Request, token string) bool {
+	if constantTimeStringEqual(req.Header.Get("X-CTF-Agent-Token"), token) {
+		return true
+	}
+	auth := strings.TrimSpace(req.Header.Get("Authorization"))
+	if strings.HasPrefix(strings.ToLower(auth), "bearer ") &&
+		constantTimeStringEqual(strings.TrimSpace(auth[len("bearer "):]), token) {
+		return true
+	}
+	_, password, ok := req.BasicAuth()
+	return ok && constantTimeStringEqual(password, token)
+}
+
+func constantTimeStringEqual(got string, want string) bool {
+	got = strings.TrimSpace(got)
+	want = strings.TrimSpace(want)
+	if got == "" || want == "" || len(got) != len(want) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}
+
+func corsMiddleware(allowedOrigins []string) gin.HandlerFunc {
+	allowed := make(map[string]struct{}, len(allowedOrigins))
+	for _, origin := range allowedOrigins {
+		if origin = strings.TrimSpace(origin); origin != "" && origin != "*" {
+			allowed[origin] = struct{}{}
+		}
+	}
+	return func(c *gin.Context) {
+		if origin := strings.TrimSpace(c.GetHeader("Origin")); origin != "" {
+			if _, ok := allowed[origin]; ok {
+				c.Header("Access-Control-Allow-Origin", origin)
+				c.Header("Vary", "Origin")
+			}
+		}
 		c.Header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-		c.Header("Access-Control-Allow-Headers", "*")
+		c.Header("Access-Control-Allow-Headers", "Authorization,Content-Type,X-CTF-Agent-Token")
 		if c.Request.Method == "OPTIONS" {
 			c.Status(204)
 			c.Abort()

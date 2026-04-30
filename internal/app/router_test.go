@@ -54,6 +54,86 @@ func TestHealthAndTaskListHandlers(t *testing.T) {
 	}
 }
 
+func TestAuthMiddlewareProtectsApplicationRoutes(t *testing.T) {
+	t.Parallel()
+
+	service := newTestService(t)
+	defer service.Close()
+	service.cfg.AccessToken = "test-access-token"
+	server := httptest.NewServer(NewRouter(service))
+	defer server.Close()
+
+	health, err := http.Get(server.URL + "/health")
+	if err != nil {
+		t.Fatalf("GET /health: %v", err)
+	}
+	defer health.Body.Close()
+	if health.StatusCode != http.StatusOK {
+		t.Fatalf("health status=%d", health.StatusCode)
+	}
+
+	unauthorized, err := http.Get(server.URL + "/api/tasks")
+	if err != nil {
+		t.Fatalf("GET unauthorized tasks: %v", err)
+	}
+	defer unauthorized.Body.Close()
+	if unauthorized.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status=%d want %d", unauthorized.StatusCode, http.StatusUnauthorized)
+	}
+
+	req, err := http.NewRequest(http.MethodGet, server.URL+"/api/tasks", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer test-access-token")
+	authorized, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET authorized tasks: %v", err)
+	}
+	defer authorized.Body.Close()
+	if authorized.StatusCode != http.StatusOK {
+		t.Fatalf("authorized status=%d want %d", authorized.StatusCode, http.StatusOK)
+	}
+}
+
+func TestCorsMiddlewareUsesExplicitAllowedOrigins(t *testing.T) {
+	t.Parallel()
+
+	service := newTestService(t)
+	defer service.Close()
+	service.cfg.AllowedOrigins = []string{"https://ctf.example"}
+	server := httptest.NewServer(NewRouter(service))
+	defer server.Close()
+
+	req, err := http.NewRequest(http.MethodOptions, server.URL+"/api/tasks", nil)
+	if err != nil {
+		t.Fatalf("NewRequest allowed: %v", err)
+	}
+	req.Header.Set("Origin", "https://ctf.example")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("OPTIONS allowed: %v", err)
+	}
+	defer resp.Body.Close()
+	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "https://ctf.example" {
+		t.Fatalf("allowed origin header=%q", got)
+	}
+
+	blockedReq, err := http.NewRequest(http.MethodOptions, server.URL+"/api/tasks", nil)
+	if err != nil {
+		t.Fatalf("NewRequest blocked: %v", err)
+	}
+	blockedReq.Header.Set("Origin", "https://evil.example")
+	blocked, err := http.DefaultClient.Do(blockedReq)
+	if err != nil {
+		t.Fatalf("OPTIONS blocked: %v", err)
+	}
+	defer blocked.Body.Close()
+	if got := blocked.Header.Get("Access-Control-Allow-Origin"); got != "" {
+		t.Fatalf("blocked origin should not receive CORS header, got %q", got)
+	}
+}
+
 func TestContainerListShowsRunningAndRetainedUnsolvedContainers(t *testing.T) {
 	t.Parallel()
 
@@ -80,7 +160,6 @@ func TestContainerListShowsRunningAndRetainedUnsolvedContainers(t *testing.T) {
 			Status:          StatusFailed,
 			ContainerName:   "ctf-agent-retained",
 			ContainerKept:   true,
-			OpenCodeWebURL:  "http://127.0.0.1:49152",
 			OpenCodeSession: "ses_demo",
 			CreatedAt:       now.Add(time.Second),
 		},
@@ -215,6 +294,210 @@ func TestSetProviderFormatKeepsActiveFormatWhenPersistFails(t *testing.T) {
 	}
 	if got := service.ActiveProviderFormat(); got != ProviderFormatOpenAICompatible {
 		t.Fatalf("active provider changed after persist failure: %q", got)
+	}
+}
+
+func TestServicePrefersExplicitProviderFormatEnvOverSavedState(t *testing.T) {
+	t.Setenv("OPENCODE_PROVIDER_FORMAT", ProviderFormatOpenAICompatible)
+	dataDir := t.TempDir()
+	if err := os.WriteFile(
+		filepath.Join(dataDir, "provider.json"),
+		[]byte(`{"format":"anthropic"}`),
+		0o600,
+	); err != nil {
+		t.Fatalf("write provider state: %v", err)
+	}
+
+	service, err := NewService(Config{
+		DataDir:                dataDir,
+		ChallengeDir:           filepath.Join(dataDir, "challenges"),
+		DockerImage:            "ctf-agent-opencode:latest",
+		MaxContainers:          1,
+		OpenCodeProviderFormat: ProviderFormatOpenAICompatible,
+		OpenCodeProviders: map[string]OpenCodeProviderConfig{
+			ProviderFormatOpenAICompatible: {
+				Format:       ProviderFormatOpenAICompatible,
+				Label:        "OpenAI兼容",
+				ProviderID:   "ctf",
+				ProviderName: "CTF Gateway",
+				ProviderNPM:  "@ai-sdk/openai-compatible",
+				BaseURL:      "https://gateway.example/v1",
+				APIKey:       "openai-key",
+				Model:        "gpt-demo",
+			},
+			ProviderFormatAnthropic: {
+				Format:       ProviderFormatAnthropic,
+				Label:        "Anthropic",
+				ProviderID:   "anthropic",
+				ProviderName: "Anthropic",
+				ProviderNPM:  "@ai-sdk/anthropic",
+				BaseURL:      "https://api.anthropic.com/v1",
+				APIKey:       "anthropic-key",
+				Model:        "claude-demo",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+	defer service.Close()
+
+	if got := service.ActiveProviderFormat(); got != ProviderFormatOpenAICompatible {
+		t.Fatalf("ActiveProviderFormat=%q want %q", got, ProviderFormatOpenAICompatible)
+	}
+}
+
+func TestTaskMessagesHandlerStateRules(t *testing.T) {
+	t.Parallel()
+
+	service := newTestService(t)
+	defer service.Close()
+	runnerMessages := make(chan string, 1)
+	service.runDockerHint = func(_ Config, task *Task, message string, logSink LogSink) (DockerResult, error) {
+		runnerMessages <- message
+		logSink("Observation: final readable OpenCode output:\n还需要继续分析。\n")
+		return DockerResult{ExitCode: 1, ContainerName: task.ContainerName, Retained: true}, nil
+	}
+	now := time.Now().UTC()
+	flag := "flag{done}"
+	for _, task := range []*Task{
+		{
+			ID:            "running-message",
+			Name:          "running-message",
+			Category:      "misc",
+			Description:   "running",
+			Status:        StatusRunning,
+			ContainerName: "ctf-agent-running-message",
+			ContainerKept: true,
+			CreatedAt:     now,
+		},
+		{
+			ID:              "failed-message",
+			Name:            "failed-message",
+			Category:        "misc",
+			Description:     "failed retained",
+			Status:          StatusFailed,
+			ContainerName:   "ctf-agent-failed-message",
+			ContainerKept:   true,
+			OpenCodeSession: "ses_failed",
+			CreatedAt:       now.Add(time.Second),
+		},
+		{
+			ID:            "solved-message",
+			Name:          "solved-message",
+			Category:      "misc",
+			Description:   "solved",
+			Status:        StatusSolved,
+			Flag:          &flag,
+			ContainerName: "ctf-agent-solved-message",
+			ContainerKept: true,
+			CreatedAt:     now.Add(2 * time.Second),
+		},
+	} {
+		if err := service.store.Add(task); err != nil {
+			t.Fatalf("Add(%s): %v", task.ID, err)
+		}
+	}
+	server := httptest.NewServer(NewRouter(service))
+	defer server.Close()
+	postMessage := func(taskID string) *http.Response {
+		t.Helper()
+		resp, err := http.Post(
+			server.URL+"/api/tasks/"+taskID+"/messages",
+			"application/json",
+			bytes.NewBufferString(`{"message":"try another path"}`),
+		)
+		if err != nil {
+			t.Fatalf("POST message %s: %v", taskID, err)
+		}
+		return resp
+	}
+
+	running := postMessage("running-message")
+	defer running.Body.Close()
+	if running.StatusCode != http.StatusConflict {
+		t.Fatalf("running message status=%d want %d", running.StatusCode, http.StatusConflict)
+	}
+
+	solved := postMessage("solved-message")
+	defer solved.Body.Close()
+	if solved.StatusCode != http.StatusBadRequest {
+		t.Fatalf("solved message status=%d want %d", solved.StatusCode, http.StatusBadRequest)
+	}
+
+	failed := postMessage("failed-message")
+	defer failed.Body.Close()
+	if failed.StatusCode != http.StatusAccepted {
+		t.Fatalf("failed retained message status=%d want %d", failed.StatusCode, http.StatusAccepted)
+	}
+	select {
+	case got := <-runnerMessages:
+		if got != "try another path" {
+			t.Fatalf("runner message=%q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected retained failed task to continue through Docker hint runner")
+	}
+}
+
+func TestTerminalTaskResponseMessageStatusServerDriven(t *testing.T) {
+	t.Parallel()
+
+	response := newTaskResponse(&Task{
+		ID:              "terminal-response",
+		Name:            "terminal-response",
+		Category:        "misc",
+		Description:     "failed retained",
+		Status:          StatusFailed,
+		ContainerName:   "ctf-agent-terminal-response",
+		ContainerKept:   true,
+		OpenCodeSession: "ses_terminal",
+		CreatedAt:       time.Now().UTC(),
+	})
+	if response.OpenCodeSession != "ses_terminal" || !response.OpenCodeAvailable || response.OpenCodeStatus != "ready" {
+		t.Fatalf("unexpected opencode state: %+v", response)
+	}
+	if !response.CanSendMessage || response.MessageStatus == "" {
+		t.Fatalf("message state not server driven: %+v", response)
+	}
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("Marshal response: %v", err)
+	}
+	if bytes.Contains(encoded, []byte("opencode_web_url")) || bytes.Contains(encoded, []byte("opencode_host_port")) {
+		t.Fatalf("terminal response leaked legacy web fields: %s", encoded)
+	}
+}
+
+func TestRemovedOpenCodeRoute(t *testing.T) {
+	t.Parallel()
+
+	service := newTestService(t)
+	defer service.Close()
+	task := &Task{
+		ID:              "terminal-only",
+		Name:            "terminal-only",
+		Category:        "misc",
+		Description:     "terminal",
+		Status:          StatusFailed,
+		ContainerName:   "ctf-agent-terminal-only",
+		ContainerKept:   true,
+		OpenCodeSession: "ses_terminal",
+		CreatedAt:       time.Now().UTC(),
+	}
+	if err := service.store.Add(task); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	server := httptest.NewServer(NewRouter(service))
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/api/tasks/" + task.ID + "/opencode")
+	if err != nil {
+		t.Fatalf("GET removed opencode route: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("removed opencode route status=%d want %d", resp.StatusCode, http.StatusNotFound)
 	}
 }
 

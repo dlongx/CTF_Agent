@@ -1,7 +1,8 @@
 package app
 
 import (
-	"encoding/base64"
+	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -19,6 +20,8 @@ type Config struct {
 	MaxContainers          int
 	PidsLimit              string
 	DisableNetwork         bool
+	AccessToken            string
+	AllowedOrigins         []string
 	AgentScript            string
 	SkillsDir              string
 	OpenCodeProviderFormat string
@@ -29,10 +32,6 @@ type Config struct {
 	OpenCodeBaseURL        string
 	OpenCodeAPIKey         string
 	OpenCodeModel          string
-	OpenCodeWebEnabled     bool
-	OpenCodeWebBindIP      string
-	OpenCodeWebPublicBase  string
-	OpenCodeServerPassword string
 }
 
 const (
@@ -56,6 +55,7 @@ func LoadConfig() Config {
 	if err != nil {
 		root = "."
 	}
+	loadLocalEnvFile(filepath.Join(root, "opencode.env"))
 	dataDir := absPath(root, getenv("CTF_AGENT_DATA_DIR", "data"))
 	defaultImage := getenv("CTF_AGENT_DOCKER_IMAGE", "ctf-agent-opencode:latest")
 	providers := loadOpenCodeProviders()
@@ -72,6 +72,8 @@ func LoadConfig() Config {
 		MaxContainers:          getenvInt("CTF_AGENT_MAX_CONTAINERS", 4),
 		PidsLimit:              getenv("CTF_AGENT_PIDS_LIMIT", "1024"),
 		DisableNetwork:         getenvBool("CTF_AGENT_DISABLE_NETWORK", false),
+		AccessToken:            strings.TrimSpace(os.Getenv("CTF_AGENT_ACCESS_TOKEN")),
+		AllowedOrigins:         splitCSV(os.Getenv("CTF_AGENT_ALLOWED_ORIGINS")),
 		AgentScript:            absPath(root, getenv("CTF_AGENT_AGENT_SCRIPT", filepath.Join("runtime", "opencode", "bridge.py"))),
 		SkillsDir:              absPath(root, getenv("CTF_AGENT_SKILLS_DIR", filepath.Join("runtime", "opencode", "skills"))),
 		OpenCodeProviderFormat: providerFormat,
@@ -82,10 +84,40 @@ func LoadConfig() Config {
 		OpenCodeBaseURL:        activeProvider.BaseURL,
 		OpenCodeAPIKey:         activeProvider.APIKey,
 		OpenCodeModel:          activeProvider.Model,
-		OpenCodeWebEnabled:     getenvBool("CTF_AGENT_OPENCODE_WEB_ENABLED", true),
-		OpenCodeWebBindIP:      getenv("CTF_AGENT_OPENCODE_BIND_IP", "127.0.0.1"),
-		OpenCodeWebPublicBase:  getenv("CTF_AGENT_OPENCODE_PUBLIC_BASE_URL", "http://127.0.0.1"),
-		OpenCodeServerPassword: strings.TrimSpace(os.Getenv("OPENCODE_SERVER_PASSWORD")),
+	}
+}
+
+func loadLocalEnvFile(path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	lines := strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n")
+	for _, raw := range lines {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		if key == "" || strings.ContainsAny(key, " \t") {
+			continue
+		}
+		if strings.TrimSpace(os.Getenv(key)) != "" {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if len(value) >= 2 {
+			first := value[0]
+			last := value[len(value)-1]
+			if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+				value = value[1 : len(value)-1]
+			}
+		}
+		_ = os.Setenv(key, value)
 	}
 }
 
@@ -100,6 +132,13 @@ func (c Config) withOpenCodeProviderDefaults() Config {
 		return c.WithOpenCodeProvider(provider)
 	}
 	return c
+}
+
+func (c Config) ValidateServerSecurity() error {
+	if strings.TrimSpace(c.AccessToken) != "" || isLoopbackListenAddr(c.Addr) {
+		return nil
+	}
+	return errors.New("CTF_AGENT_ACCESS_TOKEN is required when CTF_AGENT_GO_ADDR is not a loopback address")
 }
 
 func (c Config) ProviderForFormat(format string) (OpenCodeProviderConfig, bool) {
@@ -203,31 +242,6 @@ func canonicalProviderFormat(format string) (string, bool) {
 	}
 }
 
-func (c Config) OpenCodeWebURL(hostPort string) string {
-	hostPort = strings.TrimSpace(hostPort)
-	if hostPort == "" {
-		return ""
-	}
-	base := strings.TrimRight(strings.TrimSpace(c.OpenCodeWebPublicBase), "/")
-	if base == "" {
-		base = "http://127.0.0.1"
-	}
-	if !strings.Contains(base, "://") {
-		base = "http://" + base
-	}
-	return base + ":" + hostPort
-}
-
-func (c Config) OpenCodeSessionURL(hostPort string, sessionID string) string {
-	base := c.OpenCodeWebURL(hostPort)
-	sessionID = strings.TrimSpace(sessionID)
-	if base == "" || sessionID == "" {
-		return base
-	}
-	workspaceSlug := base64.RawURLEncoding.EncodeToString([]byte("/workspace"))
-	return base + "/" + workspaceSlug + "/session/" + sessionID
-}
-
 func getenv(name string, fallback string) string {
 	if value := strings.TrimSpace(os.Getenv(name)); value != "" {
 		return value
@@ -249,6 +263,29 @@ func getenvBool(name string, fallback bool) bool {
 		return fallback
 	}
 	return value == "1" || value == "true" || value == "yes" || value == "on"
+}
+
+func splitCSV(value string) []string {
+	parts := strings.Split(value, ",")
+	items := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if item := strings.TrimSpace(part); item != "" {
+			items = append(items, item)
+		}
+	}
+	return items
+}
+
+func isLoopbackListenAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(addr))
+	if err != nil {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func absPath(root string, value string) string {
