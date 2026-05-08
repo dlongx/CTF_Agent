@@ -2,11 +2,14 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -51,6 +54,104 @@ func TestHealthAndTaskListHandlers(t *testing.T) {
 	}
 	if len(payload.Tasks) != 1 || payload.Tasks[0].ID != "task-1" {
 		t.Fatalf("tasks payload=%+v", payload)
+	}
+}
+
+func TestClearResultsHandlerClearsFlagsAndWriteups(t *testing.T) {
+	t.Parallel()
+
+	service := newTestService(t)
+	defer service.Close()
+	flag := "flag{old}"
+	writeupName := "old_wp.md"
+	task := &Task{
+		ID:              "clear-results",
+		Name:            "clear results",
+		Category:        "misc",
+		Description:     "clear",
+		Status:          StatusSolved,
+		Flag:            &flag,
+		WriteupFileName: writeupName,
+		CreatedAt:       time.Now().UTC(),
+	}
+	if err := service.store.Add(task); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := service.store.SaveWriteup(task.ID, task.WriteupFileName, "# old\n"); err != nil {
+		t.Fatalf("SaveWriteup: %v", err)
+	}
+	server := httptest.NewServer(NewRouter(service))
+	defer server.Close()
+
+	resp, err := http.Post(server.URL+"/api/maintenance/clear-results", "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST clear-results: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("clear-results status=%d", resp.StatusCode)
+	}
+	got, _ := service.store.Get(task.ID)
+	if got.Status != StatusCompleted || got.Flag != nil || got.WriteupFileName != "" {
+		t.Fatalf("result data was not cleared: %+v", got)
+	}
+	if _, err := os.Stat(filepath.Join(service.cfg.ChallengeDir, task.ID, writeupName)); !os.IsNotExist(err) {
+		t.Fatalf("writeup file was not removed: %v", err)
+	}
+}
+
+func TestTaskWriteupHandlerDownloadsSolvedWriteup(t *testing.T) {
+	t.Parallel()
+
+	service := newTestService(t)
+	defer service.Close()
+	flag := "FLAG-12345"
+	task := &Task{
+		ID:              "download-writeup",
+		Name:            "download writeup",
+		Category:        "misc",
+		Description:     "download",
+		Status:          StatusSolved,
+		Flag:            &flag,
+		WriteupFileName: "download-writeup-wp.md",
+		CreatedAt:       time.Now().UTC(),
+	}
+	if err := service.store.Add(task); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := service.store.SaveWriteup(task.ID, task.WriteupFileName, "# WP\n\nFLAG-12345\n"); err != nil {
+		t.Fatalf("SaveWriteup: %v", err)
+	}
+	server := httptest.NewServer(NewRouter(service))
+	defer server.Close()
+
+	detail, err := http.Get(server.URL + "/api/tasks/" + task.ID)
+	if err != nil {
+		t.Fatalf("GET task detail: %v", err)
+	}
+	defer detail.Body.Close()
+	var payload taskResponse
+	if err := json.NewDecoder(detail.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode task detail: %v", err)
+	}
+	if !payload.HasWriteup || payload.WriteupFileName != task.WriteupFileName {
+		t.Fatalf("writeup metadata missing: %+v", payload)
+	}
+
+	resp, err := http.Get(server.URL + "/api/tasks/" + task.ID + "/writeup")
+	if err != nil {
+		t.Fatalf("GET writeup: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("writeup status=%d", resp.StatusCode)
+	}
+	body := new(bytes.Buffer)
+	if _, err := body.ReadFrom(resp.Body); err != nil {
+		t.Fatalf("read writeup body: %v", err)
+	}
+	if !strings.Contains(body.String(), "FLAG-12345") {
+		t.Fatalf("writeup body=%q", body.String())
 	}
 }
 
@@ -234,6 +335,82 @@ func TestTaskIDFromWebSocketPath(t *testing.T) {
 	}
 }
 
+func TestTaskLogsTailQuery(t *testing.T) {
+	t.Parallel()
+
+	service := newTestService(t)
+	defer service.Close()
+	task := &Task{
+		ID:          "tail-task",
+		Name:        "tail task",
+		Category:    "misc",
+		Description: "demo task",
+		Status:      StatusRunning,
+		CreatedAt:   time.Now().UTC(),
+	}
+	if err := service.store.Add(task); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := service.store.AppendLog(task.ID, "alpha\nbravo\ncharlie\n"); err != nil {
+		t.Fatalf("AppendLog: %v", err)
+	}
+	server := httptest.NewServer(NewRouter(service))
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/api/tasks/" + task.ID + "/logs?tail=8")
+	if err != nil {
+		t.Fatalf("GET task logs tail: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("logs status=%d", resp.StatusCode)
+	}
+	var payload struct {
+		Logs string `json:"logs"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode logs: %v", err)
+	}
+	if payload.Logs != "charlie\n" {
+		t.Fatalf("logs=%q", payload.Logs)
+	}
+}
+
+func TestCreateTaskReturnsTooManyRequestsWhenQueueFull(t *testing.T) {
+	t.Parallel()
+
+	service := newTestService(t)
+	service.Close()
+	for i := 0; i < cap(service.queue); i++ {
+		service.queue <- "blocked-" + strconvItoa(i)
+	}
+	server := httptest.NewServer(NewRouter(service))
+	defer server.Close()
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	for key, value := range map[string]string{
+		"name":        "queue-full",
+		"type":        "misc",
+		"description": "queue full",
+	} {
+		if err := writer.WriteField(key, value); err != nil {
+			t.Fatalf("WriteField(%s): %v", key, err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close multipart writer: %v", err)
+	}
+	resp, err := http.Post(server.URL+"/api/tasks", writer.FormDataContentType(), body)
+	if err != nil {
+		t.Fatalf("POST /api/tasks: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status=%d want %d", resp.StatusCode, http.StatusTooManyRequests)
+	}
+}
+
 func TestProviderSettingsHandlers(t *testing.T) {
 	t.Parallel()
 
@@ -353,7 +530,7 @@ func TestTaskMessagesHandlerStateRules(t *testing.T) {
 	service := newTestService(t)
 	defer service.Close()
 	runnerMessages := make(chan string, 1)
-	service.runDockerHint = func(_ Config, task *Task, message string, logSink LogSink) (DockerResult, error) {
+	service.runDockerHint = func(_ context.Context, _ Config, task *Task, message string, logSink LogSink) (DockerResult, error) {
 		runnerMessages <- message
 		logSink("Observation: final readable OpenCode output:\n还需要继续分析。\n")
 		return DockerResult{ExitCode: 1, ContainerName: task.ContainerName, Retained: true}, nil
@@ -383,15 +560,16 @@ func TestTaskMessagesHandlerStateRules(t *testing.T) {
 			CreatedAt:       now.Add(time.Second),
 		},
 		{
-			ID:            "solved-message",
-			Name:          "solved-message",
-			Category:      "misc",
-			Description:   "solved",
-			Status:        StatusSolved,
-			Flag:          &flag,
-			ContainerName: "ctf-agent-solved-message",
-			ContainerKept: true,
-			CreatedAt:     now.Add(2 * time.Second),
+			ID:              "solved-message",
+			Name:            "solved-message",
+			Category:        "misc",
+			Description:     "solved",
+			Status:          StatusSolved,
+			Flag:            &flag,
+			ContainerName:   "ctf-agent-solved-message",
+			ContainerKept:   true,
+			OpenCodeSession: "ses_solved",
+			CreatedAt:       now.Add(2 * time.Second),
 		},
 	} {
 		if err := service.store.Add(task); err != nil {
@@ -421,8 +599,8 @@ func TestTaskMessagesHandlerStateRules(t *testing.T) {
 
 	solved := postMessage("solved-message")
 	defer solved.Body.Close()
-	if solved.StatusCode != http.StatusBadRequest {
-		t.Fatalf("solved message status=%d want %d", solved.StatusCode, http.StatusBadRequest)
+	if solved.StatusCode != http.StatusAccepted {
+		t.Fatalf("solved retained message status=%d want %d", solved.StatusCode, http.StatusAccepted)
 	}
 
 	failed := postMessage("failed-message")

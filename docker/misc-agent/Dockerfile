@@ -12,9 +12,12 @@ RUN sed -i "s|http://mirrors.ustc.edu.cn/debian-security|${APT_SECURITY_MIRROR}|
 RUN apt-get -o Acquire::Retries=5 update \
     && apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
         dnsutils \
+        binwalk \
         ffmpeg \
         imagemagick \
+        iputils-ping \
         libimage-exiftool-perl \
+        dmtx-utils \
         nodejs \
         npm \
         outguess \
@@ -23,6 +26,8 @@ RUN apt-get -o Acquire::Retries=5 update \
         qrencode \
         sox \
         steghide \
+        tesseract-ocr \
+        traceroute \
         tshark \
         unrar-free \
         zbar-tools \
@@ -30,9 +35,14 @@ RUN apt-get -o Acquire::Retries=5 update \
 
 RUN python -m pip install --no-cache-dir \
         dnslib \
+        opencv-python-headless \
         pymodbus \
+        pylibdmtx \
+        pysstv \
+        pytesseract \
         pyzbar \
         qrcode \
+        scipy \
         stegpy
 
 WORKDIR /workspace

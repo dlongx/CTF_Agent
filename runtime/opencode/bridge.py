@@ -16,12 +16,9 @@ from pathlib import Path
 from typing import Any
 
 MAX_SKILL_CHARS = 12000
-FLAG_TOKEN_PATTERN = re.compile(r"\b[A-Za-z0-9_-]*flag\{[^`'\"<>\s]+\}", re.IGNORECASE)
-SOLVED_FLAG_MARKER = "这道题目已经解出"
-WRITEUP_BEGIN_MARKER = "-----BEGIN_CTF_AGENT_WRITEUP-----"
-WRITEUP_END_MARKER = "-----END_CTF_AGENT_WRITEUP-----"
 WORKSPACE_DIR = Path("/workspace")
-MAX_WRITEUP_CHARS = 120000
+DEFAULT_EXEC_DIR = WORKSPACE_DIR / ".tmp"
+SOLVED_MARKER = "这道题目已经解出"
 
 
 @dataclass(frozen=True)
@@ -43,6 +40,7 @@ class BridgeConfig:
     model: str
     user_hint: str
     session_id: str
+    exec_dir: Path
 
 
 def log(message: str) -> None:
@@ -68,6 +66,7 @@ def read_config() -> BridgeConfig:
         model=os.getenv("OPENCODE_MODEL", "").strip(),
         user_hint=os.getenv("CTF_AGENT_USER_HINT", "").strip(),
         session_id=os.getenv("OPENCODE_SESSION_ID", "").strip(),
+        exec_dir=Path(os.getenv("CTF_AGENT_EXEC_DIR", str(DEFAULT_EXEC_DIR))),
     )
 
 
@@ -143,33 +142,6 @@ def sanitize_log_text(text: str, config: BridgeConfig) -> str:
     return text
 
 
-def safe_markdown_stem(name: str, max_chars: int = 120) -> str:
-    """Return a filename-safe Markdown stem while preserving readable CTF names."""
-    stem = name.strip()
-    for char in '<>:"/\\|?*\r\n\t':
-        stem = stem.replace(char, "_")
-    stem = stem.strip(" .")
-    if not stem:
-        stem = "writeup"
-    if len(stem) > max_chars:
-        stem = stem[:max_chars].strip(" .") or "writeup"
-    return stem
-
-
-def writeup_filename(config: BridgeConfig) -> str:
-    """Return the fixed writeup filename requested by the platform contract."""
-    stem = safe_markdown_stem(config.name)
-    if stem.lower().endswith("_wp"):
-        return f"{stem}.md"
-    stem = safe_markdown_stem(stem, 117)
-    return f"{stem}_wp.md"
-
-
-def writeup_path(config: BridgeConfig) -> Path:
-    """Return the only writeup path the bridge will read or create."""
-    return WORKSPACE_DIR / writeup_filename(config)
-
-
 def category_guidance(category: str) -> str:
     """Return focused solving guidance for the submitted CTF category."""
     normalized = normalize_category(category)
@@ -214,6 +186,37 @@ def normalize_category(category: str) -> str:
     return category.strip().lower().replace("-", "_")
 
 
+def safe_filename_stem(value: str) -> str:
+    """Return a conservative workspace filename stem."""
+    value = value.strip()
+    if not value:
+        return ""
+    chars: list[str] = []
+    last_dash = False
+    for char in value:
+        if (
+            "a" <= char <= "z"
+            or "A" <= char <= "Z"
+            or "0" <= char <= "9"
+            or "\u4e00" <= char <= "\u9fff"
+            or char in "-_."
+        ):
+            chars.append(char)
+            last_dash = False
+        else:
+            if not last_dash:
+                chars.append("-")
+                last_dash = True
+    stem = "".join(chars).strip("-_. ")
+    return stem[:80].strip("-_. ")
+
+
+def writeup_filename(config: BridgeConfig) -> str:
+    """Return the expected writeup filename inside /workspace."""
+    stem = safe_filename_stem(config.name) or "challenge"
+    return f"{stem}-wp.md"
+
+
 def skill_ids_for_config(config: BridgeConfig) -> tuple[str, ...]:
     """Return skill ids in priority order."""
     if config.skill_ids:
@@ -256,30 +259,31 @@ def build_prompt(config: BridgeConfig) -> str:
     if config.attachment_dir.exists():
         files = [str(path) for path in sorted(config.attachment_dir.rglob("*")) if path.is_file()]
     skill_text = read_skill_text(config)
+    exec_dir = str(config.exec_dir)
     wp_name = writeup_filename(config)
-    wp_path = f"/workspace/{wp_name}"
 
     return (
         "You are solving a CTF challenge inside an isolated Docker container.\n"
-        "Use shell and file tools if available. Keep output concise and print the final flag.\n"
+        "Use shell and file tools if available. Keep output concise and preserve useful command output.\n"
         "Only work on the challenge files mounted at /attachments and the provided target.\n"
         "Do not ask the user for interactive confirmation; "
         "solve autonomously within this container.\n"
+        f"Use `{exec_dir}` for temporary scripts, compiled binaries, brute-force helpers, "
+        "and any file that must be executed. Do not execute generated programs from `/tmp`; "
+        "`/tmp` is mounted noexec by the platform.\n"
+        "For network checks, prefer curl, nc, or nmap -sT before raw-socket tools such as ping "
+        "or SYN scans, because container capabilities are intentionally restricted.\n"
         "When you summarize the solution, write all narrative explanations in Simplified Chinese. "
         "Keep commands, source code, file names, technical identifiers, formulas, and flags unchanged. "
         "Do not write English writeup prose unless it is part of source code or command output.\n\n"
-        "When you solve the challenge, your final response must contain this exact two-line marker block:\n"
-        f"{SOLVED_FLAG_MARKER}\n"
-        "<exact flag>\n"
-        "The marker line must be exactly the Chinese sentence above. The next non-empty line must contain "
-        "only the exact flag, with no Markdown, no label, no quotes, and no extra text. The flag wrapper "
-        "may be flag{}, DASCTF{}, ISCC{}, or any challenge-specific wrapper.\n\n"
-        f"Before the final response, create or overwrite the Markdown writeup file `{wp_path}`. "
-        "The writeup must be written in Simplified Chinese, except commands, code, filenames, formulas, "
-        "technical identifiers, and flags. Do not paste raw OpenCode logs. Do not include API keys, "
-        "environment variables, provider settings, or platform dispatcher logs. The Markdown file should "
-        "include these sections: 题目概况, 解题思路, 关键步骤, 关键命令与输出, Flag, 复现步骤, 注意事项. "
-        f"The platform will use `{wp_name}` as the final WP download file.\n\n"
+        "The host platform will keep running you until you explicitly report that the challenge is solved. "
+        "Do not output the solved marker until you have verified the final flag.\n"
+        "When solved, your final answer must contain these two consecutive lines exactly:\n"
+        f"{SOLVED_MARKER}\n"
+        "<the complete flag on this entire line>\n"
+        "The flag format is not fixed. Do not wrap it in quotes unless the quote characters are part of the flag.\n"
+        f"After finding the flag, write a Simplified Chinese writeup to `/workspace/{wp_name}`. "
+        "The writeup must include the key reasoning, commands, relevant outputs, and the final flag.\n\n"
         f"Name: {config.name}\n"
         f"Category: {config.category}\n"
         f"Target IP: {config.target_ip or 'not provided'}\n"
@@ -297,19 +301,46 @@ def build_prompt(config: BridgeConfig) -> str:
 def build_continuation_prompt(config: BridgeConfig) -> str:
     """Build a concise continuation prompt for an existing OpenCode session."""
     hint = config.user_hint.strip()
+    exec_dir = str(config.exec_dir)
     wp_name = writeup_filename(config)
-    wp_path = f"/workspace/{wp_name}"
     return (
         "继续同一个CTF题目的解题会话。请根据用户补充信息继续分析，"
-        "不要重复已经完成的无关枚举。若本轮解出题目或修正了解法，必须创建或覆盖"
-        f"`{wp_path}`，写入结构化中文Markdown WP，包含题目概况、解题思路、关键步骤、"
-        "关键命令与输出、Flag、复现步骤和注意事项。不要把原始OpenCode日志当WP。\n\n"
-        "找到Flag后必须按以下两行格式收尾:\n"
-        f"{SOLVED_FLAG_MARKER}\n"
-        "<exact flag>\n\n"
-        f"平台最终会保存`{wp_name}`作为WP文件。\n\n"
+        "不要重复已经完成的无关枚举。宿主平台会一直续跑直到你按协议声明解出；"
+        "未确认最终Flag前不要输出解出标记。\n\n"
+        f"需要生成并执行脚本或二进制时，统一放在`{exec_dir}`或`/workspace`下，"
+        "不要从`/tmp`执行，因为平台将`/tmp`挂载为noexec。\n"
+        "网络连通性检查优先使用curl、nc或nmap -sT，避免依赖raw socket权限。\n\n"
+        "确认解出后，最终回答必须包含连续两行：\n"
+        f"{SOLVED_MARKER}\n"
+        "<下一整行输出完整Flag>\n"
+        f"同时把简体中文解题过程写入`/workspace/{wp_name}`，保留命令、输出和Flag原样。\n\n"
         "用户补充信息:\n"
         f"{hint}"
+    )
+
+
+def build_session_recovery_prompt(config: BridgeConfig) -> str:
+    """Build a recovery prompt when a retained OpenCode session returns no text."""
+    hint = config.user_hint.strip()
+    exec_dir = str(config.exec_dir)
+    wp_name = writeup_filename(config)
+    return (
+        "这是同一个CTF题目的恢复执行。上一轮OpenCode session没有返回可读输出，"
+        "所以平台改用新的OpenCode session继续。不要把这当成新题重头写总结。\n\n"
+        "先检查`/workspace`和"
+        f"`{exec_dir}`中已有的脚本、临时文件和输出，"
+        "从已有线索继续做具体验证。不要重复已经完成的大范围无关枚举。\n\n"
+        "未确认最终Flag前不要输出解出标记。确认解出后，最终回答必须包含连续两行：\n"
+        f"{SOLVED_MARKER}\n"
+        "<下一整行输出完整Flag>\n"
+        f"并写入`/workspace/{wp_name}`作为简体中文WP。\n\n"
+        f"Name: {config.name}\n"
+        f"Category: {config.category}\n"
+        f"Target IP: {config.target_ip or 'not provided'}\n"
+        f"Description: {config.description}\n"
+        f"Category guidance: {category_guidance(config.category)}\n"
+        "用户补充信息:\n"
+        f"{hint or '继续上一轮未完成的验证。'}"
     )
 
 
@@ -321,50 +352,6 @@ def log_delta_preview(text: str) -> None:
     tail = clean[-1200:]
     log("Observation: assistant output updated:")
     log(tail)
-
-
-def extract_flag_token(text: str) -> str:
-    """Return the last flag-looking token found in text."""
-    matches = FLAG_TOKEN_PATTERN.findall(text)
-    if not matches:
-        return ""
-    return matches[-1].strip()
-
-
-def extract_marked_flag(text: str) -> str:
-    """Return the first line after the solved marker."""
-    lines = text.replace("\r\n", "\n").split("\n")
-    for index, line in enumerate(lines):
-        if line.strip() != SOLVED_FLAG_MARKER:
-            continue
-        if marker_looks_instructional(lines, index):
-            continue
-        for candidate in lines[index + 1 :]:
-            clean = candidate.strip().strip("`'\"，。；;")
-            if clean:
-                return clean
-    return ""
-
-
-def marker_looks_instructional(lines: list[str], index: int) -> bool:
-    """Avoid treating prompt examples as solved-marker output."""
-    context = "\n".join(lines[max(0, index - 4) : index]).lower()
-    markers = (
-        "prompt要求",
-        "final output contract",
-        "flag output contract",
-        "strictly output",
-        "marker block",
-        "最终严格输出",
-        "按以下两行",
-        "格式收尾",
-        "格式要求",
-        "示例",
-        "example",
-        "<exact flag>",
-        "<captured-or-last-line>",
-    )
-    return any(marker in context for marker in markers)
 
 
 def looks_like_prompt_echo(text: str) -> bool:
@@ -493,14 +480,14 @@ def dedupe_preserve_order(values: list[str]) -> list[str]:
     return result
 
 
-def run_opencode_terminal(config: BridgeConfig) -> str:
-    """Run OpenCode as a pure terminal command and stream readable JSON events."""
+def run_opencode_once(config: BridgeConfig, prompt: str, session_id: str) -> str:
+    """Run one OpenCode terminal command and return accumulated readable text."""
     workspace = WORKSPACE_DIR
     workspace.mkdir(parents=True, exist_ok=True)
-    runtime_tmp = Path("/workspace/.tmp")
+    runtime_tmp = config.exec_dir
     runtime_tmp.mkdir(parents=True, exist_ok=True)
     os.environ["TMPDIR"] = str(runtime_tmp)
-    prompt = build_continuation_prompt(config) if config.session_id else build_prompt(config)
+    os.environ["CTF_AGENT_EXEC_DIR"] = str(runtime_tmp)
     args = [
         "opencode",
         "run",
@@ -511,12 +498,12 @@ def run_opencode_terminal(config: BridgeConfig) -> str:
         "--title",
         config.name,
     ]
-    if config.session_id:
-        args.extend(["--session", config.session_id])
+    if session_id:
+        args.extend(["--session", session_id])
     args.append(prompt)
     log(
         "Action: run OpenCode terminal "
-        f"model={config.provider_id}/{config.model} session={config.session_id or 'new'}"
+        f"model={config.provider_id}/{config.model} session={session_id or 'new'}"
     )
     process = subprocess.Popen(
         args,
@@ -527,7 +514,7 @@ def run_opencode_terminal(config: BridgeConfig) -> str:
         bufsize=1,
     )
     blocks: list[str] = []
-    seen_session = config.session_id
+    seen_session = session_id
     last_preview = ""
     assert process.stdout is not None
     for raw_line in process.stdout:
@@ -544,82 +531,66 @@ def run_opencode_terminal(config: BridgeConfig) -> str:
     exit_code = process.wait()
     final_text = "\n\n".join(dedupe_preserve_order(blocks)).strip()
     if exit_code != 0:
-        if final_text and (extract_marked_flag(final_text) or extract_flag_token(final_text)):
-            return final_text
         raise RuntimeError(f"opencode run exited with status {exit_code}")
     return final_text
 
 
-def sanitize_writeup_content(text: str, config: BridgeConfig) -> str:
-    """Normalize generated writeup text before emitting it through logs."""
-    text = sanitize_log_text(text, config)
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = text.replace(WRITEUP_BEGIN_MARKER, "[removed writeup begin marker]")
-    text = text.replace(WRITEUP_END_MARKER, "[removed writeup end marker]")
-    text = text.strip()
-    if len(text) > MAX_WRITEUP_CHARS:
-        text = text[:MAX_WRITEUP_CHARS].rstrip()
-        text += "\n\n> WP内容超过平台限制，后续内容已截断。"
-    return text
-
-
-def build_fallback_writeup(config: BridgeConfig, final_text: str) -> str:
-    """Build a minimal Markdown writeup if OpenCode forgot to create the file."""
-    flag = extract_marked_flag(final_text) or extract_flag_token(final_text) or "未捕获"
-    excerpt = sanitize_writeup_content(final_text[-6000:], config) or "OpenCode没有输出可用的解题过程。"
-    return (
-        f"# {config.name}\n\n"
-        "## 题目概况\n\n"
-        f"- 题型:{config.category}\n"
-        f"- 目标:{config.target_ip or '未提供'}\n"
-        f"- Flag:{flag}\n\n"
-        "## 解题过程\n\n"
-        "OpenCode未按要求写入结构化WP文件，平台根据最终可读输出生成了兜底WP。\n\n"
-        "## 关键输出\n\n"
-        "```text\n"
-        f"{excerpt}\n"
-        "```\n\n"
-        "## 复现步骤\n\n"
-        "请参考上方关键输出中的命令、脚本和推导过程复现。\n"
+def run_opencode_terminal(config: BridgeConfig) -> str:
+    """Run OpenCode and recover once if an existing session returns no text."""
+    prompt = build_continuation_prompt(config) if config.session_id else build_prompt(config)
+    final_text = run_opencode_once(config, prompt, config.session_id)
+    if final_text or not config.session_id:
+        return final_text
+    log(
+        "Observation: OpenCode session returned no readable output; "
+        "retrying with a new recovery session"
     )
+    return run_opencode_once(config, build_session_recovery_prompt(config), "")
 
 
-def read_or_create_writeup(config: BridgeConfig, final_text: str) -> str:
-    """Read OpenCode's generated writeup or create a fallback file."""
-    path = writeup_path(config)
-    try:
-        content = path.read_text(encoding="utf-8")
-    except OSError:
-        content = ""
-    content = sanitize_writeup_content(content, config)
-    if content:
-        return content
-    content = build_fallback_writeup(config, final_text)
-    try:
-        path.write_text(content + "\n", encoding="utf-8")
-    except OSError as exc:
-        log(f"Warning: failed to write fallback writeup {path.name}: {exc}")
-    return content
-
-
-def emit_writeup_output(config: BridgeConfig, final_text: str) -> None:
-    """Emit the generated writeup in a stable block for the Go backend."""
-    content = read_or_create_writeup(config, final_text)
-    log(f"Observation: OpenCode writeup file: {writeup_filename(config)}")
-    log(WRITEUP_BEGIN_MARKER)
-    log(content)
-    log(WRITEUP_END_MARKER)
-
-
-def emit_final_output(config: BridgeConfig, final_text: str) -> None:
-    """Print the final readable output and the marker-based capture block."""
-    emit_writeup_output(config, final_text)
+def emit_final_output(_config: BridgeConfig, final_text: str) -> None:
+    """Print the final readable output for the host log viewer."""
     log("Observation: final readable OpenCode output:")
     log(final_text[-12000:])
-    final_line = extract_marked_flag(final_text) or extract_flag_token(final_text)
-    if final_line:
-        log(SOLVED_FLAG_MARKER)
-        log(final_line)
+
+
+def extract_solved_flag(final_text: str) -> str:
+    """Return the protocol flag line when the model declared the challenge solved."""
+    lines = final_text.replace("\r\n", "\n").split("\n")
+    for index, line in enumerate(lines):
+        if line.strip() != SOLVED_MARKER:
+            continue
+        if index + 1 >= len(lines):
+            return ""
+        flag = lines[index + 1].rstrip("\r")
+        if flag.strip():
+            return flag
+    return ""
+
+
+def ensure_writeup(config: BridgeConfig, final_text: str) -> str:
+    """Ask OpenCode once to create the writeup when a solved run did not leave one."""
+    if not extract_solved_flag(final_text):
+        return ""
+    wp_name = writeup_filename(config)
+    wp_path = WORKSPACE_DIR / wp_name
+    if wp_path.exists() and wp_path.is_file() and wp_path.stat().st_size > 0:
+        log(f"Observation: writeup file={wp_name}")
+        return wp_name
+
+    prompt = (
+        "你已经确认这道CTF题解出。现在只补写WP文件，不要重新解题。\n"
+        f"请把完整简体中文解题过程写入`/workspace/{wp_name}`，内容包括关键推理、"
+        "执行过的重要命令、关键输出、最终Flag，以及可复现步骤。"
+    )
+    try:
+        run_opencode_once(config, prompt, config.session_id)
+    except Exception as exc:
+        log(f"Warning: failed to generate writeup: {exc}")
+    if wp_path.exists() and wp_path.is_file() and wp_path.stat().st_size > 0:
+        log(f"Observation: writeup file={wp_name}")
+        return wp_name
+    return ""
 
 
 def run_bridge() -> int:
@@ -632,6 +603,7 @@ def run_bridge() -> int:
         final_text = run_opencode_terminal(config)
         if not final_text:
             raise RuntimeError("OpenCode terminal finished without readable output")
+        ensure_writeup(config, final_text)
         emit_final_output(config, final_text)
     except Exception as exc:
         log(f"Final: opencode bridge failed: {exc}")

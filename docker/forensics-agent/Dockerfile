@@ -9,12 +9,10 @@ ARG APT_SECURITY_MIRROR=http://deb.debian.org/debian-security
 RUN sed -i "s|http://mirrors.ustc.edu.cn/debian-security|${APT_SECURITY_MIRROR}|g; \
     s|http://mirrors.ustc.edu.cn/debian|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources
 
-RUN apt-get -o Acquire::Retries=5 update \
-    && apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
+RUN apt-get -o Acquire::Retries=10 -o Acquire::http::Pipeline-Depth=0 -o Acquire::http::No-Cache=true update \
+    && apt-get -o Acquire::Retries=10 -o Acquire::http::Pipeline-Depth=0 -o Acquire::http::No-Cache=true install -y --no-install-recommends \
         binwalk \
-        ffmpeg \
         foremost \
-        imagemagick \
         john \
         libimage-exiftool-perl \
         outguess \
@@ -24,14 +22,28 @@ RUN apt-get -o Acquire::Retries=5 update \
         poppler-utils \
         qrencode \
         sleuthkit \
-        sox \
         steghide \
         testdisk \
-        tshark \
         unrar-free \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN apt-get -o Acquire::Retries=10 -o Acquire::http::Pipeline-Depth=0 -o Acquire::http::No-Cache=true update \
+    && apt-get -o Acquire::Retries=10 -o Acquire::http::Pipeline-Depth=0 -o Acquire::http::No-Cache=true install -y --no-install-recommends \
+        dmtx-utils \
+        ffmpeg \
+        imagemagick \
+        iputils-ping \
+        sox \
+        tesseract-ocr \
+        traceroute \
         zbar-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN apt-get -o Acquire::Retries=10 -o Acquire::http::Pipeline-Depth=0 -o Acquire::http::No-Cache=true update \
+    && apt-get -o Acquire::Retries=10 -o Acquire::http::Pipeline-Depth=0 -o Acquire::http::No-Cache=true install -y --no-install-recommends \
         ruby \
         ruby-dev \
+        tshark \
     && rm -rf /var/lib/apt/lists/*
 
 RUN python -m pip install --no-cache-dir \
@@ -39,7 +51,12 @@ RUN python -m pip install --no-cache-dir \
         hachoir \
         matplotlib \
         oletools \
+        opencv-python-headless \
+        pylibdmtx \
+        pysstv \
+        pytesseract \
         pyshark \
+        scipy \
         stegpy \
         volatility3
 

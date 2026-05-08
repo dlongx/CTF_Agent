@@ -31,23 +31,27 @@ func NewRouter(service *Service) *gin.Engine {
 	router.GET("/api/containers", service.listContainers)
 	router.GET("/api/settings/provider", service.providerSettings)
 	router.POST("/api/settings/provider", service.updateProviderSettings)
+	router.POST("/api/maintenance/clear-results", service.clearResults)
 	router.GET("/api/tasks", service.listTasks)
 	router.POST("/api/tasks", service.createTask)
 	router.OPTIONS("/api/tasks", optionsHandler)
 	router.OPTIONS("/api/events", optionsHandler)
 	router.OPTIONS("/api/containers", optionsHandler)
 	router.OPTIONS("/api/settings/provider", optionsHandler)
+	router.OPTIONS("/api/maintenance/clear-results", optionsHandler)
 	router.GET("/api/tasks/:id", service.taskDetail)
 	router.GET("/api/tasks/:id/logs", service.taskLogs)
 	router.GET("/api/tasks/:id/writeup", service.taskWriteup)
 	router.POST("/api/tasks/:id/messages", service.taskMessage)
 	router.POST("/api/tasks/:id/hints", service.taskHint)
+	router.POST("/api/tasks/:id/stop", service.taskStop)
 	router.POST("/api/tasks/:id/container/close", service.taskCloseContainer)
 	router.OPTIONS("/api/tasks/:id", optionsHandler)
 	router.OPTIONS("/api/tasks/:id/logs", optionsHandler)
 	router.OPTIONS("/api/tasks/:id/writeup", optionsHandler)
 	router.OPTIONS("/api/tasks/:id/messages", optionsHandler)
 	router.OPTIONS("/api/tasks/:id/hints", optionsHandler)
+	router.OPTIONS("/api/tasks/:id/stop", optionsHandler)
 	router.OPTIONS("/api/tasks/:id/container/close", optionsHandler)
 	router.GET("/ws/tasks/:id/logs", func(c *gin.Context) {
 		service.websocketHandler(c.Writer, c.Request)
@@ -166,6 +170,21 @@ func (s *Service) updateProviderSettings(c *gin.Context) {
 	c.JSON(200, settings)
 }
 
+func (s *Service) clearResults(c *gin.Context) {
+	tasksUpdated, filesRemoved, err := s.store.ClearResultData()
+	if err != nil {
+		c.JSON(500, gin.H{"detail": err.Error()})
+		return
+	}
+	for _, task := range s.store.List() {
+		s.publishTaskChanged(task.ID)
+	}
+	c.JSON(200, gin.H{
+		"tasks_updated": tasksUpdated,
+		"files_removed": filesRemoved,
+	})
+}
+
 func (s *Service) createTask(c *gin.Context) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxMultipartFormBytes)
 	if err := c.Request.ParseMultipartForm(maxMultipartMemoryBytes); err != nil {
@@ -218,6 +237,10 @@ func (s *Service) createTask(c *gin.Context) {
 		CreatedAt:       time.Now().UTC(),
 	}
 	if err := s.Submit(task); err != nil {
+		if errors.Is(err, errTaskQueueFull) {
+			c.JSON(http.StatusTooManyRequests, gin.H{"detail": err.Error()})
+			return
+		}
 		c.JSON(500, gin.H{"detail": err.Error()})
 		return
 	}
@@ -304,6 +327,19 @@ func (s *Service) handleTaskMessage(c *gin.Context, message string) bool {
 }
 
 func (s *Service) taskCloseContainer(c *gin.Context) {
+	if err := s.CloseTaskContainer(c.Param("id")); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			c.JSON(404, gin.H{"detail": "task not found"})
+			return
+		}
+		c.JSON(400, gin.H{"detail": err.Error()})
+		return
+	}
+	task, _ := s.store.Get(c.Param("id"))
+	c.JSON(200, newTaskResponse(task))
+}
+
+func (s *Service) taskStop(c *gin.Context) {
 	if err := s.CloseTaskContainer(c.Param("id")); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			c.JSON(404, gin.H{"detail": "task not found"})

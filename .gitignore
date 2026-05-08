@@ -19,3 +19,4 @@ docker-build-*.log
 .tmp-*/
 /go-server.exe
 /go-server.exe~
+/flag.md

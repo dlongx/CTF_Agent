@@ -228,6 +228,8 @@ textarea {
   font: inherit;
   background: #fff;
   color: var(--text);
+  min-height: 40px;
+  transition: border-color 180ms ease, box-shadow 180ms ease, background-color 180ms ease;
 }
 
 textarea {
@@ -235,6 +237,7 @@ textarea {
 }
 
 .dropzone {
+  position: relative;
   display: flex;
   min-height: 74px;
   align-items: center;
@@ -251,10 +254,20 @@ textarea {
 }
 
 .dropzone input {
-  display: none;
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  border: 0;
+  white-space: nowrap;
 }
 
-.dropzone.dragover {
+.dropzone.dragover,
+.dropzone:focus-within {
   border-color: var(--accent);
   background: #eff6ff;
 }
@@ -280,6 +293,18 @@ button {
   color: #fff;
   font: inherit;
   cursor: pointer;
+  min-height: 40px;
+  transition: background-color 180ms ease, box-shadow 180ms ease, color 180ms ease;
+}
+
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+.dropzone:focus-within {
+  outline: 3px solid rgba(37, 99, 235, 0.28);
+  outline-offset: 2px;
 }
 
 button:hover {
@@ -345,7 +370,9 @@ button.danger:hover,
 }
 
 .card {
-  min-height: 148px;
+  display: flex;
+  flex-direction: column;
+  min-height: 160px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--panel);
@@ -354,7 +381,10 @@ button.danger:hover,
 }
 
 .card-main {
-  display: block;
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
   padding: 15px 15px 10px;
   color: inherit;
   text-decoration: none;
@@ -383,10 +413,18 @@ button.danger:hover,
   align-items: flex-start;
 }
 
+.card-head > div {
+  min-width: 0;
+}
+
 .card h3 {
+  display: block;
   margin: 0;
   font-size: 17px;
-  overflow-wrap: anywhere;
+  line-height: 1.35;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .card-subtitle {
@@ -396,13 +434,31 @@ button.danger:hover,
 }
 
 .card-meta {
-  margin-top: 18px;
+  margin-top: auto;
+  padding-top: 18px;
   color: var(--muted);
   font-size: 12px;
+  min-width: 0;
+}
+
+.card-meta span {
+  min-width: 0;
+}
+
+.card-meta span:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.card-meta span:last-child {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .card-actions {
   display: grid;
+  flex: 0 0 auto;
   gap: 8px;
   grid-template-columns: repeat(auto-fit, minmax(72px, 1fr));
   padding: 0 16px 16px;
@@ -424,6 +480,8 @@ button.danger:hover,
   text-decoration: none;
   color: var(--text);
   background: #eef2f7;
+  min-height: 40px;
+  transition: background-color 180ms ease, box-shadow 180ms ease, color 180ms ease;
 }
 
 .button-link.disabled {
@@ -493,6 +551,17 @@ button:disabled {
   margin-bottom: 6px;
   color: var(--accent);
   text-decoration: none;
+}
+
+.inline-link {
+  color: var(--accent);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.inline-link:hover {
+  color: var(--accent-strong);
+  text-decoration: underline;
 }
 
 .containers-shell {
@@ -767,7 +836,12 @@ dd {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .card {
+  .card,
+  button,
+  .button-link,
+  input,
+  select,
+  textarea {
     transition: none;
   }
 }

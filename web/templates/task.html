@@ -5,7 +5,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{.title}}</title>
-  <link rel="stylesheet" href="/static/app.css?v=terminal-20260430-detail">
+  <link rel="stylesheet" href="/static/app.css?v=card-layout-20260503b">
 </head>
 <body>
   <main class="shell detail-shell" data-task-id="{{.taskID}}" data-not-found="{{.notFound}}">
@@ -31,16 +31,16 @@
           <dd id="task-target">-</dd>
           <dt>附件数量</dt>
           <dd id="task-attachments">-</dd>
-          <dt>Flag</dt>
-          <dd id="task-flag">-</dd>
           <dt>错误</dt>
           <dd id="task-error">-</dd>
-          <dt>WP</dt>
-          <dd id="task-writeup">-</dd>
           <dt>容器</dt>
           <dd id="task-container">-</dd>
           <dt>OpenCode</dt>
           <dd id="task-opencode">-</dd>
+          <dt>Flag</dt>
+          <dd id="task-flag">-</dd>
+          <dt>WP</dt>
+          <dd id="task-writeup">-</dd>
         </dl>
         <h2>题目描述</h2>
         <pre id="task-description" class="description-box">加载中</pre>
@@ -49,10 +49,11 @@
       <section class="log-view">
         <div class="section-head">
           <h2>日志输出</h2>
-          <div class="toolbar">
+        <div class="toolbar">
             <button id="load-logs">查看日志</button>
             <button class="secondary" id="follow-logs">实时跟随</button>
             <button class="secondary" id="clear-logs">清空显示</button>
+            <button class="secondary danger" id="stop-task" disabled>停止任务</button>
           </div>
         </div>
         <pre id="logs" class="terminal">点击“查看日志”后显示logs.txt内容。</pre>
@@ -61,16 +62,16 @@
             <label for="message-input">与OpenCode交流</label>
             <span class="muted" id="message-state">加载中</span>
           </div>
-          <textarea id="message-input" rows="3" placeholder="当前回合结束后，可以在这里补充新的思路、约束或提示"></textarea>
+          <textarea id="message-input" rows="3" placeholder="当前回合结束后，可以在这里补充新的思路、约束或提示" autocomplete="off" spellcheck="false"></textarea>
           <div class="terminal-message-actions">
             <button id="send-message">发送消息</button>
-            <p class="muted" id="message-status"></p>
+            <p class="muted" id="message-status" role="status" aria-live="polite"></p>
           </div>
         </div>
       </section>
     </section>
   </main>
-  <script src="/static/app.js?v=terminal-20260430"></script>
+  <script src="/static/app.js?v=card-layout-20260503b"></script>
 </body>
 </html>
 {{end}}

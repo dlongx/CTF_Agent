@@ -146,3 +146,47 @@ func TestLoadConfigBuildsOpenCodeProviderProfiles(t *testing.T) {
 		t.Fatalf("anthropic profile=%+v ok=%v", anthropic, ok)
 	}
 }
+
+func TestOpenCodeProviderEnvRewritesLoopbackBaseURLForDocker(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{
+			name: "localhost",
+			raw:  "http://localhost:8317/v1",
+			want: "http://host.docker.internal:8317/v1",
+		},
+		{
+			name: "ipv4 loopback",
+			raw:  "http://127.0.0.1:8317/v1",
+			want: "http://host.docker.internal:8317/v1",
+		},
+		{
+			name: "ipv6 loopback",
+			raw:  "http://[::1]:8317/v1",
+			want: "http://host.docker.internal:8317/v1",
+		},
+		{
+			name: "remote gateway",
+			raw:  "https://gateway.example/v1",
+			want: "https://gateway.example/v1",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := dockerReachableBaseURL(tt.raw); got != tt.want {
+				t.Fatalf("dockerReachableBaseURL(%q)=%q want %q", tt.raw, got, tt.want)
+			}
+		})
+	}
+
+	env := strings.Join(openCodeProviderEnv(Config{OpenCodeBaseURL: "http://localhost:8317/v1"}), "\n")
+	if !strings.Contains(env, "OPENCODE_BASE_URL=http://host.docker.internal:8317/v1") {
+		t.Fatalf("openCodeProviderEnv did not rewrite loopback base url:\n%s", env)
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type Config struct {
@@ -18,6 +19,8 @@ type Config struct {
 	MemLimit               string
 	CPUs                   string
 	MaxContainers          int
+	TaskTimeout            time.Duration
+	AutoContinueRounds     int
 	PidsLimit              string
 	DisableNetwork         bool
 	AccessToken            string
@@ -70,6 +73,8 @@ func LoadConfig() Config {
 		MemLimit:               getenv("CTF_AGENT_MEM_LIMIT", "512m"),
 		CPUs:                   getenv("CTF_AGENT_CPUS", "1.0"),
 		MaxContainers:          getenvInt("CTF_AGENT_MAX_CONTAINERS", 4),
+		TaskTimeout:            getenvDuration("CTF_AGENT_TASK_TIMEOUT", 0),
+		AutoContinueRounds:     getenvInt("CTF_AGENT_AUTO_CONTINUE_ROUNDS", 6),
 		PidsLimit:              getenv("CTF_AGENT_PIDS_LIMIT", "1024"),
 		DisableNetwork:         getenvBool("CTF_AGENT_DISABLE_NETWORK", false),
 		AccessToken:            strings.TrimSpace(os.Getenv("CTF_AGENT_ACCESS_TOKEN")),
@@ -255,6 +260,18 @@ func getenvInt(name string, fallback int) int {
 		return fallback
 	}
 	return value
+}
+
+func getenvDuration(name string, fallback time.Duration) time.Duration {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback
+	}
+	duration, err := time.ParseDuration(value)
+	if err != nil || duration < 0 {
+		return fallback
+	}
+	return duration
 }
 
 func getenvBool(name string, fallback bool) bool {

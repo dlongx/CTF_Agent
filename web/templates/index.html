@@ -5,7 +5,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{.title}}</title>
-  <link rel="stylesheet" href="/static/app.css?v=terminal-20260430">
+  <link rel="stylesheet" href="/static/app.css?v=card-layout-20260503b">
 </head>
 <body>
   <main class="shell">
@@ -17,16 +17,17 @@
           <div class="provider-panel top-provider-panel" id="provider-panel">
             <div class="field">
               <label for="provider-format">模型接口格式</label>
-              <select id="provider-format">
+              <select id="provider-format" autocomplete="off">
                 <option value="">加载中</option>
               </select>
             </div>
-            <p class="muted" id="provider-status">正在读取当前模型接口配置。</p>
+            <p class="muted" id="provider-status" role="status" aria-live="polite">正在读取当前模型接口配置。</p>
           </div>
         </div>
       </div>
       <div class="topbar-actions">
         <a class="button-link secondary" href="/containers">Docker管理</a>
+        <button class="secondary danger" id="clear-results">清理历史结果</button>
         <div class="summary" id="summary">加载中</div>
       </div>
     </header>
@@ -39,11 +40,11 @@
         <form id="task-form" enctype="multipart/form-data">
           <div class="field">
             <label for="name">题目名称</label>
-            <input id="name" name="name" required placeholder="phase-demo">
+            <input id="name" name="name" required placeholder="phase-demo" autocomplete="off">
           </div>
           <div class="field">
             <label for="type">题型</label>
-            <select id="type" name="type" required>
+            <select id="type" name="type" required autocomplete="off">
               <option value="misc">misc</option>
               <option value="web">web</option>
               <option value="pwn">pwn</option>
@@ -54,23 +55,23 @@
           </div>
           <div class="field">
             <label for="target_ip">目标IP</label>
-            <input id="target_ip" name="target_ip" placeholder="可选">
+            <input id="target_ip" name="target_ip" placeholder="可选" autocomplete="off" inputmode="url">
           </div>
           <div class="field wide">
             <label for="description">题目描述</label>
-            <textarea id="description" name="description" required rows="4">请自动分析题目描述与所有附件，优先枚举文件类型、提取关键信息、根据题型选择合适工具，必要时编写脚本验证推理。找到Flag后输出最终Flag，并用中文总结关键解题步骤。</textarea>
+            <textarea id="description" name="description" required rows="4" autocomplete="off" spellcheck="false">请自动分析题目描述与所有附件，优先枚举文件类型、提取关键信息、根据题型选择合适工具，必要时编写脚本验证推理。平台只负责把题目信息传递给OpenCode并记录原始日志。</textarea>
           </div>
           <div class="field wide">
             <label for="attachments">附件</label>
             <label class="dropzone" id="dropzone" for="attachments">
-              <input id="attachments" name="attachments" type="file" multiple>
+              <input id="attachments" name="attachments" type="file" multiple aria-describedby="file-summary">
               <span class="dropzone-title">拖入附件或点击选择</span>
               <span class="dropzone-subtitle" id="file-summary">支持一次提交多个文件</span>
             </label>
           </div>
           <div class="actions">
             <button type="submit">提交题目</button>
-            <span id="form-status" class="muted"></span>
+            <span id="form-status" class="muted" role="status" aria-live="polite"></span>
           </div>
         </form>
       </section>
@@ -83,7 +84,7 @@
         <div class="filters">
           <div class="field">
             <label for="filter-type">题目类型</label>
-            <select id="filter-type">
+            <select id="filter-type" autocomplete="off">
               <option value="">全部类型</option>
               <option value="misc">misc</option>
               <option value="web">web</option>
@@ -95,16 +96,17 @@
           </div>
           <div class="field">
             <label for="filter-status">任务状态</label>
-            <select id="filter-status">
+            <select id="filter-status" autocomplete="off">
               <option value="">全部状态</option>
-              <option value="active">正在解题</option>
+              <option value="active">运行中</option>
               <option value="solved">已解出</option>
-              <option value="failed">未解出</option>
+              <option value="completed">本轮结束</option>
+              <option value="failed">运行失败</option>
             </select>
           </div>
           <div class="field">
             <label for="filter-date">日期</label>
-            <select id="filter-date">
+            <select id="filter-date" autocomplete="off">
               <option value="">全部日期</option>
               <option value="today">今天</option>
               <option value="7d">近7天</option>
@@ -116,7 +118,7 @@
       </section>
     </div>
   </main>
-  <script src="/static/app.js?v=terminal-20260430"></script>
+  <script src="/static/app.js?v=card-layout-20260503b"></script>
 </body>
 </html>
 {{end}}

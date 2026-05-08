@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -30,6 +31,11 @@ func (s *Service) websocketHandler(w http.ResponseWriter, r *http.Request) {
 	defer conn.Close()
 
 	logs, _ := s.store.Logs(taskID)
+	if tail := r.URL.Query().Get("tail"); tail != "" {
+		if limit, err := strconv.Atoi(tail); err == nil && limit > 0 && len(logs) > limit {
+			logs = logs[len(logs)-limit:]
+		}
+	}
 	if logs != "" {
 		_ = conn.WriteText(logs)
 	}

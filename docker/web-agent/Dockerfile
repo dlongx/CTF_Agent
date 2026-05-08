@@ -19,6 +19,7 @@ RUN apt-get -o Acquire::Retries=5 update \
         git \
         gobuster \
         golang-go \
+        iputils-ping \
         libcurl4-openssl-dev \
         libjson-perl \
         libnet-ssleay-perl \
@@ -26,6 +27,7 @@ RUN apt-get -o Acquire::Retries=5 update \
         libxml-writer-perl \
         perl \
         tshark \
+        traceroute \
         wafw00f \
         whatweb \
         whois \
@@ -54,7 +56,8 @@ RUN PYCURL_SSL_LIBRARY=openssl python -m pip install --no-cache-dir \
         websocket-client==1.9.0 \
         websockets==16.0
 
-RUN python -m pip install --no-cache-dir --no-deps \
+RUN python -m pip install --no-cache-dir "pip<24.1" \
+    && python -m pip install --no-cache-dir --no-deps \
         wfuzz==3.1.0 \
     && python -m pip install --no-cache-dir --upgrade \
         pip \

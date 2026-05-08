@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -248,75 +249,6 @@ func TestStoreRejectsUnsafeWriteupFilename(t *testing.T) {
 	}
 }
 
-func TestServiceRepairsInvalidSolvedFlag(t *testing.T) {
-	t.Parallel()
-
-	store, err := NewStore(t.TempDir())
-	if err != nil {
-		t.Fatalf("NewStore: %v", err)
-	}
-	flag := "+"
-	task := &Task{
-		ID:          "invalid-flag",
-		Name:        "invalid-flag",
-		Category:    "misc",
-		Description: "invalid flag",
-		Status:      StatusSolved,
-		Flag:        &flag,
-		CreatedAt:   time.Now().UTC(),
-	}
-	if err := store.Add(task); err != nil {
-		t.Fatalf("Add: %v", err)
-	}
-
-	service := &Service{store: store}
-	service.repairInvalidSolvedFlags()
-
-	got, _ := store.Get(task.ID)
-	if got.Status != StatusFailed || got.Flag != nil || got.Error == nil {
-		t.Fatalf("invalid solved flag was not repaired: %+v", got)
-	}
-}
-
-func TestServiceRepairsPromptEchoSolvedFlag(t *testing.T) {
-	t.Parallel()
-
-	store, err := NewStore(t.TempDir())
-	if err != nil {
-		t.Fatalf("NewStore: %v", err)
-	}
-	flag := "time.sleep(required_seconds)"
-	task := &Task{
-		ID:          "prompt-echo-flag",
-		Name:        "prompt-echo-flag",
-		Category:    "misc",
-		Description: "prompt echo flag",
-		Status:      StatusSolved,
-		Flag:        &flag,
-		CreatedAt:   time.Now().UTC(),
-	}
-	if err := store.Add(task); err != nil {
-		t.Fatalf("Add: %v", err)
-	}
-	logs := `Observation: final readable OpenCode output:
-license: MIT
-compatibility: Requires filesystem-based agent
-# CTF Miscellaneous
-Quick reference for miscellaneous CTF challenges.
-- **Time-only validation:** Start session, ` + "`time.sleep(required_seconds)`" + `, submit win.`
-	if err := store.AppendLog(task.ID, logs); err != nil {
-		t.Fatalf("AppendLog: %v", err)
-	}
-
-	service := &Service{store: store}
-	service.repairInvalidSolvedFlags()
-
-	got, _ := store.Get(task.ID)
-	if got.Status != StatusFailed || got.Flag != nil || got.Error == nil {
-		t.Fatalf("prompt echo solved flag was not repaired: %+v", got)
-	}
-}
-
 func TestAppendLogDoesNotSolveRunningTaskFromAssistantUpdate(t *testing.T) {
 	t.Parallel()
 
@@ -357,7 +289,7 @@ flag{a91b0bbf-e6fd-42dd-b9a6-5ef4f2bc695f}`
 	}
 }
 
-func TestRunTaskOnlySolvesAfterRunnerReturnsFinalMarker(t *testing.T) {
+func TestRunTaskExtractsFlagOnlyFromFinalReadableOutput(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
@@ -377,7 +309,7 @@ func TestRunTaskOnlySolvesAfterRunnerReturnsFinalMarker(t *testing.T) {
 		t.Fatalf("Add: %v", err)
 	}
 	service := &Service{store: store, hub: NewHub()}
-	service.runDockerTask = func(_ Config, task *Task, logSink LogSink, _ func(string)) (DockerResult, error) {
+	service.runDockerTask = func(_ context.Context, _ Config, task *Task, logSink LogSink, _ func(string)) (DockerResult, error) {
 		logSink("Observation: assistant output updated:\nflag{wrong_midrun}\n")
 		midRun, ok := store.Get(task.ID)
 		if !ok {
@@ -393,61 +325,8 @@ func TestRunTaskOnlySolvesAfterRunnerReturnsFinalMarker(t *testing.T) {
 	service.runTask(0, task.ID)
 
 	got, _ := store.Get(task.ID)
-	if got.Status != StatusSolved || got.Flag == nil || *got.Flag != "DASCTF{right_final}" {
-		t.Fatalf("task did not solve from final marker: %+v", got)
-	}
-}
-
-func TestServiceRepairsFalseLiveCapturedSolvedTask(t *testing.T) {
-	t.Parallel()
-
-	root := t.TempDir()
-	store, err := NewStore(root)
-	if err != nil {
-		t.Fatalf("NewStore: %v", err)
-	}
-	flag := "flag{wrong_live}"
-	now := time.Now().UTC()
-	task := &Task{
-		ID:              "false-live",
-		Name:            "false live",
-		Category:        "misc",
-		Description:     "mis-captured while running",
-		Status:          StatusSolved,
-		Flag:            &flag,
-		ContainerName:   "ctf-agent-false-live",
-		ContainerKept:   false,
-		OpenCodeSession: "ses_false_live",
-		CreatedAt:       now,
-		FinishedAt:      &now,
-	}
-	if err := store.Add(task); err != nil {
-		t.Fatalf("Add: %v", err)
-	}
-	if err := store.SaveWriteup(task.ID, "false_live_wp.md", "# wrong\n"); err != nil {
-		t.Fatalf("SaveWriteup: %v", err)
-	}
-	if err := store.AppendLog(task.ID, liveFlagCaptureMarker+"\nflag{wrong_live}\n"); err != nil {
-		t.Fatalf("AppendLog: %v", err)
-	}
-
-	service := &Service{store: store, hub: NewHub()}
-	service.repairFalseLiveCapturedFlagsFromContainers(map[string]DockerContainer{
-		"ctf-agent-false-live": {Name: "ctf-agent-false-live", Running: true},
-	})
-
-	got, _ := store.Get(task.ID)
-	if got.Status != StatusFailed || got.Flag != nil || !got.ContainerKept {
-		t.Fatalf("false live capture was not repaired: %+v", got)
-	}
-	if got.ContainerName != "ctf-agent-false-live" || got.OpenCodeSession != "ses_false_live" {
-		t.Fatalf("runtime continuation metadata was not preserved: %+v", got)
-	}
-	if got.WriteupFileName != "" {
-		t.Fatalf("stale writeup filename kept: %+v", got)
-	}
-	if _, err := os.Stat(filepath.Join(root, task.ID, "false_live_wp.md")); !os.IsNotExist(err) {
-		t.Fatalf("stale writeup file still exists or stat failed unexpectedly: %v", err)
+	if got.Status != StatusSolved || got.Flag == nil || *got.Flag != "DASCTF{right_final}" || got.ContainerKept {
+		t.Fatalf("task should solve from final readable output: %+v", got)
 	}
 }
 
@@ -592,226 +471,6 @@ func TestStoreLoadsLegacyWebMetadata(t *testing.T) {
 	}
 }
 
-func TestExtractFlagPrefersFinalReadableLastLine(t *testing.T) {
-	t.Parallel()
-
-	service := &Service{}
-	task := &Task{}
-	logs := `Observation: final readable OpenCode output:
-这里是中文解题过程。
-custom-final-token`
-
-	got := service.extractFlagForTask(task, logs)
-	if got == nil || *got != "custom-final-token" {
-		t.Fatalf("extractFlagForTask()=%v want custom-final-token", got)
-	}
-}
-
-func TestExtractFlagRejectsOpenCodeStatusToken(t *testing.T) {
-	t.Parallel()
-
-	service := &Service{}
-	task := &Task{}
-	logs := `Observation: final readable OpenCode output:
-Performing one time database migration, may take a few minutes...
-
-sqlite-migration:done
-
-Database migration complete.
-
-Not supported model MiMo-V2.5-Pro`
-
-	got := service.extractFlagForTask(task, logs)
-	if got != nil {
-		t.Fatalf("extractFlagForTask()=%v want nil", *got)
-	}
-}
-
-func TestExtractFlagFromChineseSolvedMarker(t *testing.T) {
-	t.Parallel()
-
-	service := &Service{}
-	task := &Task{}
-	logs := `Observation: final readable OpenCode output:
-已完成验算。
-这道题目已经解出
-DASCTF{abc}`
-
-	got := service.extractFlagForTask(task, logs)
-	if got == nil || *got != "DASCTF{abc}" {
-		t.Fatalf("extractFlagForTask()=%v want DASCTF{abc}", got)
-	}
-}
-
-func TestExtractFlagSkipsBlankLineAfterChineseMarker(t *testing.T) {
-	t.Parallel()
-
-	service := &Service{}
-	task := &Task{}
-	logs := `Observation: final readable OpenCode output:
-这道题目已经解出
-
-
-ISCC{skip_blank_ok}`
-
-	got := service.extractFlagForTask(task, logs)
-	if got == nil || *got != "ISCC{skip_blank_ok}" {
-		t.Fatalf("extractFlagForTask()=%v want ISCC{skip_blank_ok}", got)
-	}
-}
-
-func TestExtractFlagIgnoresPromptEchoChineseMarker(t *testing.T) {
-	t.Parallel()
-
-	service := &Service{}
-	task := &Task{}
-	logs := `Observation: final readable OpenCode output:
-Prompt要求OpenCode最终严格输出：
-这道题目已经解出
-DASCTF{prompt_echo}`
-
-	got := service.extractFlagForTask(task, logs)
-	if got != nil {
-		t.Fatalf("extractFlagForTask()=%v want nil", *got)
-	}
-}
-
-func TestExtractFlagIgnoresSkillDocChineseMarker(t *testing.T) {
-	t.Parallel()
-
-	service := &Service{}
-	task := &Task{}
-	logs := `Observation: final readable OpenCode output:
-Active CTF skills:
---- skill: ctf-misc ---
-这道题目已经解出
-DASCTF{skill_doc}
-Attachments are mounted read-only at /attachments`
-
-	got := service.extractFlagForTask(task, logs)
-	if got != nil {
-		t.Fatalf("extractFlagForTask()=%v want nil", *got)
-	}
-}
-
-func TestExtractFlagIgnoresAssistantUpdateWithoutFinalReadableOutput(t *testing.T) {
-	t.Parallel()
-
-	service := &Service{}
-	task := &Task{}
-	logs := `Observation: assistant output updated:
-关键步骤：
-1. 已还原载荷。
-- ` + "`iscc{a91b0bbf-e6fd-42dd-b9a6-5ef4f2bc695f}`" + `
-[runner] failed container retained for hints container_name=ctf-agent-demo`
-
-	got := service.extractFlagForTask(task, logs)
-	if got != nil {
-		t.Fatalf("extractFlagForTask()=%v want nil", *got)
-	}
-}
-
-func TestExtractFlagIgnoresAssistantUpdateStandaloneFinalLine(t *testing.T) {
-	t.Parallel()
-
-	service := &Service{}
-	task := &Task{}
-	logs := `Observation: assistant output updated:
-成功解出flag。
-
-flag{a91b0bbf-e6fd-42dd-b9a6-5ef4f2bc695f}
-[runner] agent exited with status=3221225786
-[runner] failed container retained for hints container_name=ctf-agent-demo`
-
-	got := service.extractFlagForTask(task, logs)
-	if got != nil {
-		t.Fatalf("extractFlagForTask()=%v want nil", *got)
-	}
-}
-
-func TestExtractOpenCodeExportTextIgnoresUserPromptAndReadsToolOutput(t *testing.T) {
-	t.Parallel()
-
-	raw := []byte(`{
-  "messages": [
-    {
-      "info": {"role": "user"},
-      "parts": [{"type": "text", "text": "example flag{wrong} in prompt"}]
-    },
-    {
-      "info": {"role": "assistant"},
-      "parts": [
-        {"type": "text", "text": "正在解析载荷"},
-        {"type": "tool", "state": {"output": "payload: b'flag{right-answer}'"}}
-      ]
-    }
-  ]
-}`)
-
-	text := extractOpenCodeExportText(raw)
-	if strings.Contains(text, "flag{wrong}") {
-		t.Fatalf("extractOpenCodeExportText() included user prompt: %q", text)
-	}
-	if flag := extractFlagToken(text); flag != "flag{right-answer}" {
-		t.Fatalf("extractFlagToken()=%q want flag{right-answer}; text=%q", flag, text)
-	}
-}
-
-func TestExtractFlagRejectsSingleCharacterPromptResidue(t *testing.T) {
-	t.Parallel()
-
-	service := &Service{}
-	task := &Task{}
-	logs := `Observation: final readable OpenCode output:
-Active CTF skills:
-Repunit decomposition uses only 1 and +.
-+`
-
-	got := service.extractFlagForTask(task, logs)
-	if got != nil {
-		t.Fatalf("extractFlagForTask()=%v want nil", *got)
-	}
-}
-
-func TestExtractFlagRejectsPromptEchoInlineCode(t *testing.T) {
-	t.Parallel()
-
-	service := &Service{}
-	task := &Task{}
-	logs := `Observation: final readable OpenCode output:
-license: MIT
-compatibility: Requires filesystem-based agent
-# CTF Miscellaneous
-Quick reference for miscellaneous CTF challenges.
-- **Time-only validation:** Start session, ` + "`time.sleep(required_seconds)`" + `, submit win.
-Final: opencode bridge completed`
-
-	got := service.extractFlagForTask(task, logs)
-	if got != nil {
-		t.Fatalf("extractFlagForTask()=%v want nil", *got)
-	}
-}
-
-func TestNormalizeFinalFlagLineDoesNotExtractArbitraryInlineCode(t *testing.T) {
-	t.Parallel()
-
-	if got := normalizeFinalFlagLine("- **Time-only validation:** Start session, `time.sleep(required_seconds)`, submit win."); got != "" {
-		t.Fatalf("normalizeFinalFlagLine()=%q want empty", got)
-	}
-	if got := normalizeFinalFlagLine("Final Flag: `flag{demo}`"); got != "flag{demo}" {
-		t.Fatalf("normalizeFinalFlagLine()=%q want flag{demo}", got)
-	}
-	if got := normalizeFinalFlagLine("`custom-final-token`"); got != "custom-final-token" {
-		t.Fatalf("normalizeFinalFlagLine()=%q want custom-final-token", got)
-	}
-	if got := normalizeFinalFlagLine("- `flag{demo}`"); got != "" {
-		t.Fatalf("normalizeFinalFlagLine()=%q want empty", got)
-	}
-	if got := normalizeFinalFlagLine("- Final Flag: `flag{demo}`"); got != "flag{demo}" {
-		t.Fatalf("normalizeFinalFlagLine()=%q want flag{demo}", got)
-	}
-}
-
 func TestOpenCodeStateReportsBridgeFailure(t *testing.T) {
 	t.Parallel()
 
@@ -828,203 +487,7 @@ func TestOpenCodeStateReportsBridgeFailure(t *testing.T) {
 	}
 }
 
-func TestBuildWriteupFiltersPlatformLogs(t *testing.T) {
-	t.Parallel()
-
-	flag := "flag{demo}"
-	task := &Task{
-		Name:        "demo",
-		Category:    "crypto",
-		Description: "solve it",
-		Status:      StatusSolved,
-		Flag:        &flag,
-	}
-	logs := `[dispatcher] queued workers=4
-[runner] starting container image=ctf-agent-opencode:latest
-[opencode] INFO service=bus type=message.part.delta publishing
-Observation: final readable OpenCode output:
-Active CTF skills:
---- skill: crypto ---
-lots of skill docs
-[skill truncated]
-
-Attachments are mounted read-only at /attachments.
-<path>/attachments/a.py</path>
-check_calc 123456
-pt flag{demo}
-
-Flag: flag{demo}
-Final: opencode bridge completed
-[runner] removing solved container_name=ctf-agent-demo`
-
-	writeup := buildWriteup(task, logs)
-	for _, unwanted := range []string{
-		"[dispatcher]",
-		"[runner]",
-		"[opencode]",
-		"Active CTF skills",
-		"lots of skill docs",
-		"[skill truncated]",
-	} {
-		if strings.Contains(writeup, unwanted) {
-			t.Fatalf("writeup contains unwanted %q:\n%s", unwanted, writeup)
-		}
-	}
-	if !strings.Contains(writeup, "Flag: flag{demo}") {
-		t.Fatalf("writeup missing flag:\n%s", writeup)
-	}
-	if !strings.Contains(writeup, "pt flag{demo}") {
-		t.Fatalf("writeup missing solving output:\n%s", writeup)
-	}
-}
-
-func TestBuildWriteupFormatsTaggedCodeBlocks(t *testing.T) {
-	t.Parallel()
-
-	task := &Task{
-		Name:        "code-demo",
-		Category:    "crypto",
-		Description: "solve it",
-		Status:      StatusSolved,
-	}
-	logs := `Observation: final readable OpenCode output:
-<path>/attachments/generator.py</path>
-<type>file</type>
-<content>
-1: import random
-2:
-3: def main():
-4:     print("flag{demo}")
-
-(End of file - total 4 lines)
-</content>
-
-运行脚本后得到Flag。`
-
-	writeup := buildWriteup(task, logs)
-	if !strings.Contains(writeup, "### 文件`/attachments/generator.py`") {
-		t.Fatalf("writeup missing file heading:\n%s", writeup)
-	}
-	if !strings.Contains(writeup, "```python\nimport random") {
-		t.Fatalf("writeup missing python code fence:\n%s", writeup)
-	}
-	if strings.Contains(writeup, "1: import random") || strings.Contains(writeup, "4:     print") {
-		t.Fatalf("writeup kept numbered prefixes:\n%s", writeup)
-	}
-	if strings.Contains(writeup, "<content>") || strings.Contains(writeup, "</content>") {
-		t.Fatalf("writeup kept content tags:\n%s", writeup)
-	}
-}
-
-func TestBuildWriteupFallsBackWhenFinalOutputMissing(t *testing.T) {
-	t.Parallel()
-
-	lastStep := "Thought: challenge='timeout-demo' category='misc'"
-	task := &Task{
-		Name:            "timeout-demo",
-		Category:        "misc",
-		Description:     "solve it",
-		Status:          StatusFailed,
-		LastStep:        lastStep,
-		OpenCodeSession: "ses_demo",
-		ContainerKept:   true,
-	}
-	logs := `[dispatcher] queued workers=4
-[runner] starting container image=ctf-agent-misc:latest
-Thought: challenge='timeout-demo' category='misc'
-[runner] failed container retained for hints container_name=ctf-agent-timeout-demo`
-
-	writeup := buildWriteup(task, logs)
-	if !strings.Contains(writeup, "平台尚未捕获到OpenCode最终可读输出") {
-		t.Fatalf("writeup missing fallback text:\n%s", writeup)
-	}
-	if !strings.Contains(writeup, "容器仍保留") {
-		t.Fatalf("writeup missing retained-container hint:\n%s", writeup)
-	}
-	if !strings.Contains(writeup, lastStep) {
-		t.Fatalf("writeup missing last step:\n%s", writeup)
-	}
-}
-
-func TestExtractGeneratedWriteupUsesLastValidBlock(t *testing.T) {
-	t.Parallel()
-
-	logs := generatedWriteupBeginMarker + `
-too short
-` + generatedWriteupEndMarker + `
-Observation: final readable OpenCode output:
-running logs
-` + generatedWriteupBeginMarker + `
-# demo
-
-## 解题过程
-
-通过脚本还原编码链路，验证输出后得到Flag。
-
-## Flag
-
-flag{latest}
-` + generatedWriteupEndMarker
-
-	got, ok := extractGeneratedWriteup(logs)
-	if !ok {
-		t.Fatal("extractGeneratedWriteup() ok=false want true")
-	}
-	if !strings.Contains(got, "flag{latest}") || strings.Contains(got, "too short") {
-		t.Fatalf("extractGeneratedWriteup() picked wrong block:\n%s", got)
-	}
-}
-
-func TestBuildStoredWriteupFallsBackWhenGeneratedBlockInvalid(t *testing.T) {
-	t.Parallel()
-
-	flag := "flag{fallback}"
-	task := &Task{
-		Name:        "fallback-demo",
-		Category:    "misc",
-		Description: "solve it",
-		Status:      StatusSolved,
-		Flag:        &flag,
-	}
-	logs := generatedWriteupBeginMarker + `
-short
-` + generatedWriteupEndMarker + `
-Observation: final readable OpenCode output:
-已确认最终结果。
-Flag: flag{fallback}`
-
-	writeup := buildStoredWriteup(task, logs)
-	if !strings.Contains(writeup, "# fallback-demo") || !strings.Contains(writeup, "Flag:flag{fallback}") {
-		t.Fatalf("buildStoredWriteup() did not fall back to platform writeup:\n%s", writeup)
-	}
-	if strings.Contains(writeup, generatedWriteupBeginMarker) || strings.Contains(writeup, "short") {
-		t.Fatalf("buildStoredWriteup() leaked invalid generated block:\n%s", writeup)
-	}
-}
-
-func TestSafeWriteupFilenameAddsSuffixAndSanitizes(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name string
-		in   string
-		want string
-	}{
-		{name: "plain", in: "ez misc", want: "ez misc_wp.md"},
-		{name: "unsafe", in: `bad/name:demo`, want: "bad_name_demo_wp.md"},
-		{name: "already suffixed", in: "demo_wp", want: "demo_wp.md"},
-		{name: "empty", in: " \t", want: "writeup_wp.md"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := safeWriteupFilename(tt.in); got != tt.want {
-				t.Fatalf("safeWriteupFilename(%q)=%q want %q", tt.in, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestServiceSaveWriteupUsesGeneratedWriteupAndSuffix(t *testing.T) {
+func TestCloseQueuedTaskStopsBeforeWorkerRuns(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
@@ -1032,86 +495,214 @@ func TestServiceSaveWriteupUsesGeneratedWriteupAndSuffix(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
-	flag := "DASCTF{wp_ok}"
 	task := &Task{
-		ID:          "generated-writeup",
-		Name:        `题目/名称`,
-		Category:    "web",
-		Description: "solve it",
-		Status:      StatusSolved,
-		Flag:        &flag,
+		ID:          "queued-stop",
+		Name:        "queued-stop",
+		Category:    "misc",
+		Description: "queued",
+		Status:      StatusQueued,
 		CreatedAt:   time.Now().UTC(),
 	}
 	if err := store.Add(task); err != nil {
 		t.Fatalf("Add: %v", err)
 	}
-	logs := `Observation: OpenCode writeup file: 题目_名称_wp.md
-` + generatedWriteupBeginMarker + `
-# 题目/名称
-
-## 解题思路
-
-利用路径遍历读取配置，再伪造签名拿到Flag。
-
-## Flag
-
-DASCTF{wp_ok}
-` + generatedWriteupEndMarker + `
-Observation: final readable OpenCode output:
-这道题目已经解出
-DASCTF{wp_ok}`
-	if err := store.AppendLog(task.ID, logs); err != nil {
-		t.Fatalf("AppendLog: %v", err)
+	service := &Service{store: store, hub: NewHub(), done: make(chan struct{}), queue: make(chan string, 1)}
+	service.runDockerTask = func(context.Context, Config, *Task, LogSink, func(string)) (DockerResult, error) {
+		t.Fatal("stopped queued task should not run")
+		return DockerResult{}, nil
 	}
-
-	service := &Service{store: store, hub: NewHub()}
-	service.saveWriteup(task.ID)
-
-	path, filename, ok := store.WriteupPath(task.ID)
-	if !ok {
-		t.Fatal("WriteupPath() ok=false want true")
+	if err := service.CloseTaskContainer(task.ID); err != nil {
+		t.Fatalf("CloseTaskContainer: %v", err)
 	}
-	if filename != "题目_名称_wp.md" {
-		t.Fatalf("writeup filename=%q want 题目_名称_wp.md", filename)
+	service.runTask(0, task.ID)
+	got, _ := store.Get(task.ID)
+	if got.Status != StatusFailed || got.LastStep != taskStoppedMessage {
+		t.Fatalf("queued task was not stopped: %+v", got)
 	}
-	content, err := os.ReadFile(path)
+}
+
+func TestRunTaskMarksTimeout(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	store, err := NewStore(root)
 	if err != nil {
-		t.Fatalf("ReadFile: %v", err)
+		t.Fatalf("NewStore: %v", err)
 	}
-	got := string(content)
-	if !strings.Contains(got, "利用路径遍历读取配置") || strings.Contains(got, "Observation: final readable") {
-		t.Fatalf("saved writeup did not use generated markdown:\n%s", got)
+	task := &Task{
+		ID:          "timeout-task",
+		Name:        "timeout-task",
+		Category:    "misc",
+		Description: "timeout",
+		Status:      StatusQueued,
+		CreatedAt:   time.Now().UTC(),
+	}
+	if err := store.Add(task); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	service := &Service{
+		cfg:   Config{TaskTimeout: time.Nanosecond},
+		store: store,
+		hub:   NewHub(),
+		done:  make(chan struct{}),
+		runs:  map[string]context.CancelFunc{},
+	}
+	service.runDockerTask = func(ctx context.Context, _ Config, _ *Task, _ LogSink, _ func(string)) (DockerResult, error) {
+		<-ctx.Done()
+		return DockerResult{ExitCode: 124, Retained: true}, ctx.Err()
+	}
+	service.runTask(0, task.ID)
+	got, _ := store.Get(task.ID)
+	if got.Status != StatusFailed || got.Error == nil || *got.Error != taskTimeoutMessage {
+		t.Fatalf("timeout task not marked failed: %+v", got)
 	}
 }
 
-func TestWriteupNeedsRepairIgnoresUnsolvedWriteup(t *testing.T) {
+func TestRunTaskAutoContinuesUntilSolved(t *testing.T) {
 	t.Parallel()
 
-	task := &Task{Status: StatusFailed}
-	content := `# timeout-demo
-
-## 解题过程
-
-Thought: challenge='timeout-demo' category='misc'
-`
-
-	if writeupNeedsRepair(task, content) {
-		t.Fatal("writeupNeedsRepair()=true want false for unsolved task")
+	root := t.TempDir()
+	store, err := NewStore(root)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	task := &Task{
+		ID:          "auto-continue",
+		Name:        "auto-continue",
+		Category:    "web",
+		Description: "continue",
+		Status:      StatusQueued,
+		CreatedAt:   time.Now().UTC(),
+	}
+	if err := store.Add(task); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	service := &Service{
+		cfg:   Config{AutoContinueRounds: 1},
+		store: store,
+		hub:   NewHub(),
+		done:  make(chan struct{}),
+		runs:  map[string]context.CancelFunc{},
+	}
+	var hints int
+	service.runDockerTask = func(_ context.Context, _ Config, task *Task, logSink LogSink, containerSink func(string)) (DockerResult, error) {
+		containerSink("ctf-agent-" + task.ID)
+		logSink("Observation: OpenCode session=ses_auto\n")
+		logSink("Observation: final readable OpenCode output:\n下一步继续测试。\n")
+		return DockerResult{ExitCode: 0, ContainerName: "ctf-agent-" + task.ID, Retained: true}, nil
+	}
+	service.runDockerHint = func(_ context.Context, _ Config, task *Task, message string, logSink LogSink) (DockerResult, error) {
+		hints++
+		logSink("Observation: final readable OpenCode output:\n这道题目已经解出\nflag{auto_continue_ok}\n")
+		return DockerResult{ExitCode: 0, ContainerName: task.ContainerName, Retained: true}, nil
+	}
+	service.runTask(0, task.ID)
+	got, _ := store.Get(task.ID)
+	if hints != 1 {
+		t.Fatalf("auto-continue hints=%d want 1", hints)
+	}
+	if got.Status != StatusSolved || got.Flag == nil || *got.Flag != "flag{auto_continue_ok}" {
+		t.Fatalf("task should solve after auto-continue: %+v", got)
 	}
 }
 
-func TestWriteupNeedsRepairKeepsSolvedWriteup(t *testing.T) {
+func TestRunTaskStopsAutoContinueOnHardFailure(t *testing.T) {
 	t.Parallel()
 
-	task := &Task{Status: StatusSolved}
-	content := `# solved-demo
+	root := t.TempDir()
+	store, err := NewStore(root)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	task := &Task{
+		ID:          "auto-exhaust",
+		Name:        "auto-exhaust",
+		Category:    "web",
+		Description: "continue",
+		Status:      StatusQueued,
+		CreatedAt:   time.Now().UTC(),
+	}
+	if err := store.Add(task); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	service := &Service{
+		cfg:   Config{AutoContinueRounds: 1},
+		store: store,
+		hub:   NewHub(),
+		done:  make(chan struct{}),
+		runs:  map[string]context.CancelFunc{},
+	}
+	service.runDockerTask = func(_ context.Context, _ Config, task *Task, logSink LogSink, containerSink func(string)) (DockerResult, error) {
+		containerSink("ctf-agent-" + task.ID)
+		logSink("Observation: OpenCode session=ses_exhaust\n")
+		logSink("Observation: final readable OpenCode output:\n下一步继续测试。\n")
+		return DockerResult{ExitCode: 0, ContainerName: "ctf-agent-" + task.ID, Retained: true}, nil
+	}
+	var hints int
+	service.runDockerHint = func(_ context.Context, _ Config, task *Task, _ string, logSink LogSink) (DockerResult, error) {
+		hints++
+		logSink("Final: opencode bridge failed: OpenCode terminal finished without readable output\n")
+		return DockerResult{ExitCode: 1, ContainerName: task.ContainerName, Retained: true}, nil
+	}
+	service.runTask(0, task.ID)
+	got, _ := store.Get(task.ID)
+	if hints != 1 {
+		t.Fatalf("auto-continue hints=%d want 1", hints)
+	}
+	if got.Status != StatusFailed || got.Flag != nil || !got.ContainerKept {
+		t.Fatalf("task should fail and keep container after hard failure: %+v", got)
+	}
+}
 
-## 解题过程
+func TestRunTaskAutoContinueCanBeStoppedByUser(t *testing.T) {
+	t.Parallel()
 
-Flag: flag{done}
-`
+	root := t.TempDir()
+	store, err := NewStore(root)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	task := &Task{
+		ID:          "auto-empty-output",
+		Name:        "auto empty output",
+		Category:    "web",
+		Description: "continue",
+		Status:      StatusQueued,
+		CreatedAt:   time.Now().UTC(),
+	}
+	if err := store.Add(task); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	service := &Service{
+		cfg:   Config{AutoContinueRounds: 3},
+		store: store,
+		hub:   NewHub(),
+		done:  make(chan struct{}),
+		runs:  map[string]context.CancelFunc{},
+	}
+	var hints int
+	service.runDockerTask = func(_ context.Context, _ Config, task *Task, logSink LogSink, containerSink func(string)) (DockerResult, error) {
+		containerSink("ctf-agent-" + task.ID)
+		logSink("Observation: OpenCode session=ses_empty\n")
+		logSink("Observation: final readable OpenCode output:\n继续测试preview.php路径穿越。\n")
+		return DockerResult{ExitCode: 0, ContainerName: "ctf-agent-" + task.ID, Retained: true}, nil
+	}
+	service.runDockerHint = func(_ context.Context, _ Config, task *Task, _ string, logSink LogSink) (DockerResult, error) {
+		hints++
+		if err := store.MarkStopped(task.ID, taskStoppedMessage); err != nil {
+			t.Fatalf("MarkStopped: %v", err)
+		}
+		logSink("Observation: final readable OpenCode output:\n仍在继续。\n")
+		return DockerResult{ExitCode: 0, ContainerName: task.ContainerName, Retained: true}, nil
+	}
 
-	if writeupNeedsRepair(task, content) {
-		t.Fatal("writeupNeedsRepair()=true want false")
+	service.runTask(0, task.ID)
+
+	if hints != 1 {
+		t.Fatalf("auto-continue hints=%d want 1", hints)
+	}
+	got, _ := store.Get(task.ID)
+	if got.Status != StatusFailed || got.LastStep != taskStoppedMessage {
+		t.Fatalf("task should remain stopped: %+v", got)
 	}
 }

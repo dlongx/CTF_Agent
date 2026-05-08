@@ -17,7 +17,11 @@ type Store struct {
 	tasks map[string]*Task
 }
 
-const containerClosedMessage = "容器已关闭"
+const (
+	containerClosedMessage = "容器已关闭"
+	taskStoppedMessage     = "任务已停止"
+	taskTimeoutMessage     = "任务执行超时"
+)
 
 func NewStore(root string) (*Store, error) {
 	store := &Store{root: root, tasks: map[string]*Task{}}
@@ -137,8 +141,30 @@ func (s *Store) MarkRunning(id string) error {
 }
 
 func (s *Store) MarkFinished(id string, exitCode int, flag *string, lastStep string, containerName string, containerKept bool) error {
+	return s.MarkFinishedWithFailureMessage(id, exitCode, flag, lastStep, containerName, containerKept, "")
+}
+
+func (s *Store) MarkCompleted(id string, exitCode int, lastStep string, containerName string, containerKept bool) error {
 	return s.update(id, func(task *Task) {
 		now := time.Now().UTC()
+		task.ExitCode = &exitCode
+		task.Flag = nil
+		task.Error = nil
+		task.FinishedAt = &now
+		task.LastStep = strings.TrimSpace(lastStep)
+		if task.LastStep == "" {
+			task.LastStep = "OpenCode本轮执行结束"
+		}
+		task.ContainerName = containerName
+		task.ContainerKept = containerKept
+		task.Status = StatusCompleted
+	})
+}
+
+func (s *Store) MarkFinishedWithFailureMessage(id string, exitCode int, flag *string, lastStep string, containerName string, containerKept bool, failureMessage string) error {
+	return s.update(id, func(task *Task) {
+		now := time.Now().UTC()
+		failureMessage = strings.TrimSpace(failureMessage)
 		task.ExitCode = &exitCode
 		task.Flag = flag
 		task.FinishedAt = &now
@@ -150,7 +176,9 @@ func (s *Store) MarkFinished(id string, exitCode int, flag *string, lastStep str
 			task.Error = nil
 		} else {
 			task.Status = StatusFailed
-			if task.Error == nil {
+			if failureMessage != "" {
+				task.Error = &failureMessage
+			} else if task.Error == nil {
 				msg := "runner exited with status " + strconvItoa(exitCode)
 				task.Error = &msg
 			}
@@ -251,6 +279,49 @@ func (s *Store) SaveWriteup(id string, filename string, content string) error {
 	return s.writeTask(task)
 }
 
+func (s *Store) ClearResultData() (int, int, error) {
+	if s.root == "" {
+		return 0, 0, errors.New("store root is empty")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tasksUpdated := 0
+	filesRemoved := 0
+	for _, task := range s.tasks {
+		changed := false
+		if task.Flag != nil {
+			task.Flag = nil
+			changed = true
+		}
+		if task.WriteupFileName != "" {
+			if isSafeStoredFilename(task.WriteupFileName) {
+				if err := os.Remove(filepath.Join(s.root, task.ID, task.WriteupFileName)); err == nil {
+					filesRemoved++
+				} else if err != nil && !os.IsNotExist(err) {
+					return tasksUpdated, filesRemoved, err
+				}
+			}
+			task.WriteupFileName = ""
+			changed = true
+		}
+		if task.Status == StatusSolved {
+			task.Status = StatusCompleted
+			task.Error = nil
+			if strings.TrimSpace(task.LastStep) == "" || task.LastStep == "Flag已捕获" {
+				task.LastStep = "历史Flag/WP结果已清理"
+			}
+			changed = true
+		}
+		if changed {
+			tasksUpdated++
+			if err := s.writeTask(task); err != nil {
+				return tasksUpdated, filesRemoved, err
+			}
+		}
+	}
+	return tasksUpdated, filesRemoved, nil
+}
+
 func (s *Store) WriteupPath(id string) (string, string, bool) {
 	task, ok := s.Get(id)
 	if !ok || task.Status != StatusSolved || task.WriteupFileName == "" {
@@ -278,6 +349,19 @@ func (s *Store) MarkContainerClosed(id string) error {
 			task.Error = stringPtr(containerClosedMessage)
 			task.FinishedAt = &now
 		}
+	})
+}
+
+func (s *Store) MarkStopped(id string, message string) error {
+	return s.update(id, func(task *Task) {
+		now := time.Now().UTC()
+		task.Status = StatusFailed
+		task.Error = &message
+		task.LastStep = message
+		task.FinishedAt = &now
+		task.ContainerKept = false
+		task.ContainerName = ""
+		task.OpenCodeSession = ""
 	})
 }
 

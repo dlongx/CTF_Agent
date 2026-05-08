@@ -10,6 +10,7 @@ ARG APT_MIRROR=http://deb.debian.org/debian
 ARG APT_SECURITY_MIRROR=http://deb.debian.org/debian-security
 ARG JADX_VERSION=1.5.2
 ARG JADX_SHA256=5a8b480839c9c61527895d81d5572182279d973abe112047417f237df958a3aa
+ARG RADARE2_VERSION=5.9.8
 
 RUN sed -i "s|http://mirrors.ustc.edu.cn/debian-security|${APT_SECURITY_MIRROR}|g; \
     s|http://mirrors.ustc.edu.cn/debian|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources
@@ -30,9 +31,17 @@ RUN apt-get -o Acquire::Retries=5 update \
         gcc \
         gcc-aarch64-linux-gnu \
         g++ \
+        iputils-ping \
         make \
+        qemu-user \
+        qemu-user-binfmt \
+        qemu-utils \
+        tesseract-ocr \
+        traceroute \
         unzip \
         upx-ucl \
+        wine \
+        wine64 \
         wget \
         xxd \
         zipalign \
@@ -48,6 +57,19 @@ RUN set -eux; \
     ln -sf /opt/jadx/bin/jadx /usr/local/bin/jadx; \
     ln -sf /opt/jadx/bin/jadx-gui /usr/local/bin/jadx-gui; \
     rm -f /tmp/jadx.zip
+
+RUN set -eux; \
+    ln -sf /usr/bin/wine /usr/local/bin/wine64; \
+    wget -O /tmp/radare2.tar.xz "https://github.com/radareorg/radare2/releases/download/${RADARE2_VERSION}/radare2-${RADARE2_VERSION}.tar.xz"; \
+    mkdir -p /tmp/radare2-src; \
+    tar -C /tmp/radare2-src --strip-components=1 -xJf /tmp/radare2.tar.xz; \
+    cd /tmp/radare2-src; \
+    ./configure --prefix=/usr/local; \
+    make -j"$(nproc)"; \
+    make install; \
+    ldconfig; \
+    r2 -v; \
+    rm -rf /tmp/radare2.tar.xz /tmp/radare2-src
 
 RUN set -eux; \
     mkdir -p "${ANDROID_STUBS_ARM64}" "${ANDROID_STUBS_X86_64}"; \
@@ -82,9 +104,14 @@ RUN python -m pip install --no-cache-dir \
         frida-tools \
         keystone-engine \
         lief \
+        opencv-python-headless \
         objection \
+        pylibdmtx \
+        pysstv \
+        pytesseract \
         qiling \
         r2pipe \
+        scipy \
         unicorn \
         uncompyle6 \
         z3-solver

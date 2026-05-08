@@ -169,6 +169,8 @@ CTF_AGENT_CATEGORY_IMAGES=web=ctf-agent-web:latest,pwn=ctf-agent-pwn:latest
 CTF_AGENT_MEM_LIMIT=512m
 CTF_AGENT_CPUS=1.0
 CTF_AGENT_MAX_CONTAINERS=4
+CTF_AGENT_TASK_TIMEOUT=0
+CTF_AGENT_AUTO_CONTINUE_ROUNDS=6
 CTF_AGENT_PIDS_LIMIT=1024
 CTF_AGENT_DISABLE_NETWORK=false
 CTF_AGENT_AGENT_SCRIPT=runtime/opencode/bridge.py
@@ -188,7 +190,9 @@ OPENCODE_ANTHROPIC_API_KEY=your-anthropic-key
 OPENCODE_ANTHROPIC_MODEL=claude-sonnet-4-5
 ```
 
-Go调度层和OpenCode桥接层不再设置解题总时长超时。任务会一直运行到解出Flag、容器内Agent退出，或用户在Docker管理页手动销毁容器。
+`CTF_AGENT_TASK_TIMEOUT`默认`0`，表示不设置单题总时长超时；也可以设置为Go duration格式，例如`30m`、`2h`。任务会运行到解出Flag、容器内Agent退出、达到超时，或用户在任务详情页点击停止任务/Docker管理页手动销毁容器。
+
+`CTF_AGENT_AUTO_CONTINUE_ROUNDS`控制自动续跑轮数，默认`6`。当OpenCode一轮正常结束但没有输出合法Flag，并且容器和OpenCode session仍可用时，后端会自动向同一session发送继续解题提示；用完轮数仍未解出时才标记为`failed`并保留容器供手动继续。
 
 如果把`CTF_AGENT_GO_ADDR`改成`0.0.0.0:8000`、`:8000`或其他非回环地址，必须配置`CTF_AGENT_ACCESS_TOKEN`。浏览器访问页面时把该值作为HTTP Basic Auth密码；API客户端可使用`Authorization: Bearer <token>`。`CTF_AGENT_ALLOWED_ORIGINS`为空时不输出跨域头，只支持同源访问；需要跨域时填写明确来源，例如`https://ctf.example`，多个来源用英文逗号分隔。
 
@@ -221,8 +225,8 @@ Flag提取规则：
 
 ```text
 1.优先精确匹配一行“这道题目已经解出”
-2.捕获该标记之后的下一条非空、非平台日志行作为Flag
-3.保留旧final readable OpenCode output最后一行和flag{}正则作为历史兼容兜底
+2.捕获该标记的下一整行作为Flag，该行不能为空
+3.没有两行协议时不会伪造Flag，会继续同一OpenCode session或标记本轮未解出
 ```
 
 因此Prompt会强制要求OpenCode解出后按以下两行收尾：
@@ -233,6 +237,23 @@ Flag提取规则：
 ```
 
 未解出但容器保留时，任务详情页终端下方可以发送消息继续同一个OpenCodesession；当前回合运行中不能插话。
+
+详细规则见[Flag提取逻辑](docs/flag-extraction.md)。
+
+## 真实链路烟测
+
+后端启动、模型配置和Docker镜像准备好后，可以运行：
+
+```bat
+smoke-opencode.bat
+```
+
+脚本会向`http://127.0.0.1:8000`提交一个最小misc题，等待OpenCode读取附件中的`flag{ctf_agent_smoke_ok}`，并验证任务状态、Flag和WP下载。若服务不在默认地址，设置：
+
+```bat
+set CTF_AGENT_SMOKE_URL=http://127.0.0.1:8000
+smoke-opencode.bat
+```
 
 ## 内置Skills
 

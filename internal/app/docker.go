@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
+	"net/url"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -12,12 +14,18 @@ import (
 	"sync"
 )
 
+const dockerHostInternal = "host.docker.internal"
+
 type LogSink func(string)
 
 type DockerResult struct {
-	ExitCode      int
-	ContainerName string
-	Retained      bool
+	ExitCode        int
+	ContainerName   string
+	Retained        bool
+	Solved          bool
+	Flag            string
+	WriteupFileName string
+	WriteupContent  string
 }
 
 type DockerContainer struct {
@@ -70,14 +78,13 @@ func ListDockerContainers() (map[string]DockerContainer, error) {
 	return containers, nil
 }
 
-func RunDockerTask(cfg Config, task *Task, logSink LogSink, containerSink func(string)) (DockerResult, error) {
+func RunDockerTask(ctx context.Context, cfg Config, task *Task, logSink LogSink, containerSink func(string)) (DockerResult, error) {
 	if cfg.AgentScript == "" {
 		return DockerResult{ExitCode: 2}, errors.New("CTF_AGENT_AGENT_SCRIPT is empty")
 	}
 	if cfg.SkillsDir == "" {
 		return DockerResult{ExitCode: 2}, errors.New("CTF_AGENT_SKILLS_DIR is empty")
 	}
-	ctx := context.Background()
 
 	containerName := "ctf-agent-" + task.ID
 	_ = exec.Command("docker", "rm", "-f", containerName).Run()
@@ -92,6 +99,7 @@ func RunDockerTask(cfg Config, task *Task, logSink LogSink, containerSink func(s
 		"--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
 		"-w", "/workspace",
 	}
+	args = append(args, dockerHostGatewayArgs(cfg.OpenCodeBaseURL)...)
 	args = append(args,
 		"-v", dockerMount(cfg.AgentScript)+":/opt/ctf_agent/agent.py:ro",
 		"-v", dockerMount(cfg.SkillsDir)+":/skills:ro",
@@ -103,6 +111,7 @@ func RunDockerTask(cfg Config, task *Task, logSink LogSink, containerSink func(s
 		"-e", "ATTACHMENT_DIR=/attachments",
 		"-e", "CTF_AGENT_SKILLS_DIR=/skills",
 		"-e", "CTF_AGENT_SKILL_IDS="+normalizeCategory(task.Category),
+		"-e", "CTF_AGENT_EXEC_DIR=/workspace/.tmp",
 		"-e", "PYTHONUNBUFFERED=1",
 	)
 	if cfg.DisableNetwork {
@@ -121,6 +130,10 @@ func RunDockerTask(cfg Config, task *Task, logSink LogSink, containerSink func(s
 	}
 	result, err := runAgentInContainer(ctx, containerName, openCodeProviderEnv(cfg), logSink)
 	result.ContainerName = containerName
+	if ctx.Err() != nil {
+		_ = CloseTaskContainer(containerName)
+		return result, ctx.Err()
+	}
 	if err != nil {
 		return result, err
 	}
@@ -133,20 +146,23 @@ func RunDockerTask(cfg Config, task *Task, logSink LogSink, containerSink func(s
 	return result, nil
 }
 
-func RunDockerHint(cfg Config, task *Task, hint string, logSink LogSink) (DockerResult, error) {
+func RunDockerHint(ctx context.Context, cfg Config, task *Task, hint string, logSink LogSink) (DockerResult, error) {
 	if task.ContainerName == "" || !task.ContainerKept {
 		return DockerResult{ExitCode: 2}, errors.New("no retained container for this task")
 	}
 	if !isManagedContainerName(task.ContainerName) {
 		return DockerResult{ExitCode: 2}, errors.New("refusing unmanaged container name")
 	}
-	ctx := context.Background()
 	logSink("[runner] continuing retained container_name=" + task.ContainerName + "\n")
 	env := append(openCodeProviderEnv(cfg), "CTF_AGENT_USER_HINT="+hint)
 	if task.OpenCodeSession != "" {
 		env = append(env, "OPENCODE_SESSION_ID="+task.OpenCodeSession)
 	}
 	result, err := runAgentInContainer(ctx, task.ContainerName, env, logSink)
+	if ctx.Err() != nil {
+		_ = CloseTaskContainer(task.ContainerName)
+		return result, ctx.Err()
+	}
 	if err != nil {
 		return result, err
 	}
@@ -180,15 +196,77 @@ func CloseTaskContainer(containerName string) error {
 	return nil
 }
 
+func ReadContainerWorkspaceFile(ctx context.Context, containerName string, filename string) (string, error) {
+	if strings.TrimSpace(containerName) == "" {
+		return "", errors.New("container name is empty")
+	}
+	if !isManagedContainerName(containerName) {
+		return "", errors.New("refusing unmanaged container name")
+	}
+	if !isSafeStoredFilename(filename) {
+		return "", errors.New("invalid workspace filename")
+	}
+	output, err := exec.CommandContext(ctx, "docker", "exec", containerName, "cat", "/workspace/"+filename).CombinedOutput()
+	if err != nil {
+		message := strings.TrimSpace(string(output))
+		if message == "" {
+			message = err.Error()
+		}
+		return "", errors.New(message)
+	}
+	return string(output), nil
+}
+
 func openCodeProviderEnv(cfg Config) []string {
 	return []string{
 		"OPENCODE_PROVIDER_ID=" + cfg.OpenCodeProviderID,
 		"OPENCODE_PROVIDER_NAME=" + cfg.OpenCodeProviderName,
 		"OPENCODE_PROVIDER_NPM=" + cfg.OpenCodeProviderNPM,
-		"OPENCODE_BASE_URL=" + cfg.OpenCodeBaseURL,
+		"OPENCODE_BASE_URL=" + dockerReachableBaseURL(cfg.OpenCodeBaseURL),
 		"OPENCODE_API_KEY=" + cfg.OpenCodeAPIKey,
 		"OPENCODE_MODEL=" + cfg.OpenCodeModel,
 	}
+}
+
+func dockerReachableBaseURL(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	parsed, err := url.Parse(trimmed)
+	if err != nil || parsed.Host == "" {
+		return trimmed
+	}
+	host := parsed.Hostname()
+	if !isLoopbackHost(host) {
+		return trimmed
+	}
+	if port := parsed.Port(); port != "" {
+		parsed.Host = net.JoinHostPort(dockerHostInternal, port)
+	} else {
+		parsed.Host = dockerHostInternal
+	}
+	return parsed.String()
+}
+
+func dockerHostGatewayArgs(baseURL string) []string {
+	if runtime.GOOS == "windows" || !usesDockerHostInternal(baseURL) {
+		return nil
+	}
+	return []string{"--add-host", dockerHostInternal + ":host-gateway"}
+}
+
+func usesDockerHostInternal(baseURL string) bool {
+	parsed, err := url.Parse(dockerReachableBaseURL(baseURL))
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(parsed.Hostname(), dockerHostInternal)
+}
+
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func runAgentInContainer(ctx context.Context, containerName string, env []string, logSink LogSink) (DockerResult, error) {
@@ -216,6 +294,10 @@ func runAgentInContainer(ctx context.Context, containerName string, env []string
 	err = cmd.Wait()
 	wg.Wait()
 	if err != nil {
+		if ctx.Err() != nil {
+			logSink("[runner] agent execution canceled: " + ctx.Err().Error() + "\n")
+			return DockerResult{ExitCode: 124, ContainerName: containerName}, ctx.Err()
+		}
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			logSink("[runner] agent exited with status=" + strconvItoa(exitErr.ExitCode()) + "\n")

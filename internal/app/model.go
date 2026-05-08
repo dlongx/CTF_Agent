@@ -8,10 +8,11 @@ import (
 type TaskStatus string
 
 const (
-	StatusQueued  TaskStatus = "queued"
-	StatusRunning TaskStatus = "running"
-	StatusSolved  TaskStatus = "solved"
-	StatusFailed  TaskStatus = "failed"
+	StatusQueued    TaskStatus = "queued"
+	StatusRunning   TaskStatus = "running"
+	StatusCompleted TaskStatus = "completed"
+	StatusSolved    TaskStatus = "solved"
+	StatusFailed    TaskStatus = "failed"
 )
 
 type Task struct {
@@ -119,6 +120,7 @@ type providerOptionResponse struct {
 func newTaskResponse(task *Task) taskResponse {
 	openCodeStatus, openCodeMessage, openCodeAvailable := openCodeState(task)
 	canSendMessage, messageStatus := terminalMessageState(task)
+	hasWriteup := task != nil && task.Status == StatusSolved && task.WriteupFileName != ""
 	return taskResponse{
 		ID:                task.ID,
 		Name:              task.Name,
@@ -131,7 +133,7 @@ func newTaskResponse(task *Task) taskResponse {
 		Error:             task.Error,
 		LastStep:          task.LastStep,
 		WriteupFileName:   task.WriteupFileName,
-		HasWriteup:        task.Status == StatusSolved && task.WriteupFileName != "",
+		HasWriteup:        hasWriteup,
 		ContainerName:     task.ContainerName,
 		ContainerKept:     task.ContainerKept,
 		OpenCodeSession:   task.OpenCodeSession,
@@ -174,8 +176,6 @@ func terminalMessageState(task *Task) (bool, string) {
 	switch task.Status {
 	case StatusQueued, StatusRunning:
 		return false, "当前回合运行中，结束后可继续发送"
-	case StatusSolved:
-		return false, "任务已解出"
 	}
 	if !task.ContainerKept || task.ContainerName == "" {
 		return false, "容器未保留，不能继续发送"

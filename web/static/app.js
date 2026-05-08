@@ -9,6 +9,9 @@ let dockerCardsPointerInside = false;
 let pendingContainerRender = false;
 const fastRefreshDelayMs = 50;
 const activeRefreshIntervalMs = 1500;
+const logTailBytes = 240000;
+const logWindowChars = 240000;
+const logTailNotice = `[日志较长，当前只显示最近约${Math.round(logTailBytes / 1024)}KB。完整内容仍保存在logs.txt和API中。]\n\n`;
 
 function statusBadge(status, id = '') {
   const idAttr = id ? ` id="${escapeHTML(id)}"` : '';
@@ -37,6 +40,21 @@ function text(value, fallback = '-') {
   return value === undefined || value === null || value === '' ? fallback : String(value);
 }
 
+function renderLogWindow(logs, maybeTruncated = false) {
+  let value = logs || '';
+  const truncated = maybeTruncated || value.length > logWindowChars;
+  if (value.length > logWindowChars) {
+    value = value.slice(-logWindowChars);
+  }
+  return truncated ? logTailNotice + value : value;
+}
+
+function appendLogWindow(logBox, chunk) {
+  const current = logBox.textContent === '连接实时日志中...\n' ? '' : logBox.textContent;
+  logBox.textContent = renderLogWindow(current + chunk, current.length + chunk.length > logWindowChars);
+  logBox.scrollTop = logBox.scrollHeight;
+}
+
 async function fetchJSON(url, options) {
   const response = await fetch(url, options);
   const data = await response.json().catch(() => ({}));
@@ -57,7 +75,7 @@ async function loadCards() {
     return acc;
   }, {});
   const activeCount = (counts.running || 0) + (counts.queued || 0);
-  summary.textContent = `总计${allTasks.length}个任务 · 正在解题${activeCount} · 已解出${counts.solved || 0} · 未解出${counts.failed || 0}`;
+  summary.textContent = `总计${allTasks.length}个任务 · 运行中${activeCount} · 已解出${counts.solved || 0} · 失败${counts.failed || 0}`;
   renderCards();
 }
 
@@ -123,34 +141,77 @@ function renderCards() {
     return;
   }
   cards.innerHTML = tasks.map((task) => {
-    const writeupAction = task.status === 'solved' && task.has_writeup
-      ? `<a class="button-link secondary" href="/api/tasks/${encodeURIComponent(task.id)}/writeup">下载WP</a>`
-      : '';
     return `
       <article class="card">
         <a class="card-main" href="/tasks/${encodeURIComponent(task.id)}">
           <div class="card-head">
             <div>
-              <h3>${escapeHTML(task.name)}</h3>
+              <h3 title="${escapeHTML(task.name)}">${escapeHTML(task.name)}</h3>
               <div class="card-subtitle">${escapeHTML(task.category || '-')} · 附件${task.attachment_count || 0}</div>
             </div>
             ${statusBadge(task.status)}
           </div>
           <div class="card-meta">
-            <span>${task.flag ? '已捕获Flag' : '未捕获Flag'}</span>
+            <span>${escapeHTML(text(task.last_step, taskStatusText(task.status)))}</span>
             <span>${fmtTime(task.created_at)}</span>
           </div>
         </a>
         <div class="card-actions">
-          ${writeupAction}
-          <button class="secondary copy-flag" data-flag="${escapeHTML(task.flag || '')}" ${task.flag ? '' : 'disabled'}>${task.flag ? '复制Flag' : '暂无Flag'}</button>
+          ${cardPrimaryAction(task)}
+          ${task.has_writeup ? `<a class="button-link secondary" href="/api/tasks/${encodeURIComponent(task.id)}/writeup">下载WP</a>` : ''}
         </div>
       </article>
     `;
   }).join('');
-  document.querySelectorAll('.copy-flag').forEach((button) => {
-    button.addEventListener('click', copyFlag);
+  cards.querySelectorAll('.copy-flag-card').forEach((button) => {
+    button.addEventListener('click', copyFlagFromCard);
   });
+}
+
+function cardPrimaryAction(task) {
+  if (task.status === 'solved' && task.flag) {
+    return `<button class="secondary copy-flag-card" type="button" data-task-id="${escapeHTML(task.id)}">复制flag</button>`;
+  }
+  return `<a class="button-link secondary" href="/tasks/${encodeURIComponent(task.id)}">查看日志</a>`;
+}
+
+async function copyFlagFromCard(event) {
+  const button = event.currentTarget;
+  const taskID = button.dataset.taskId;
+  const task = allTasks.find((item) => item.id === taskID);
+  if (!task?.flag) return;
+  const originalText = button.textContent;
+  button.disabled = true;
+  try {
+    await copyText(task.flag);
+    button.textContent = '已复制';
+  } catch {
+    button.textContent = '复制失败';
+  } finally {
+    setTimeout(() => {
+      button.textContent = originalText || '复制flag';
+      button.disabled = false;
+    }, 1400);
+  }
+}
+
+async function copyText(value) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+  const textarea = document.createElement('textarea');
+  textarea.value = value;
+  textarea.setAttribute('readonly', '');
+  textarea.style.position = 'fixed';
+  textarea.style.opacity = '0';
+  document.body.appendChild(textarea);
+  textarea.select();
+  const copied = document.execCommand('copy');
+  textarea.remove();
+  if (!copied) {
+    throw new Error('copy failed');
+  }
 }
 
 async function loadContainers() {
@@ -221,10 +282,11 @@ function containerStateText(state) {
 }
 
 function taskStatusText(status) {
-  if (status === 'queued') return '正在解题';
-  if (status === 'running') return '正在解题';
+  if (status === 'queued') return '排队中';
+  if (status === 'running') return '运行中';
+  if (status === 'completed') return '本轮结束';
   if (status === 'solved') return '已解出';
-  if (status === 'failed') return '未解出';
+  if (status === 'failed') return '运行失败';
   return status || '-';
 }
 
@@ -235,10 +297,8 @@ function filteredTasks() {
   const now = new Date();
   return allTasks.filter((task) => {
     if (type && task.category !== type) return false;
-    if (status === 'solved' && task.status !== 'solved') return false;
     if (status === 'active' && !['running', 'queued'].includes(task.status)) return false;
-    if (status === 'unsolved' && task.status !== 'failed') return false;
-    if (['running', 'queued', 'failed'].includes(status) && task.status !== status) return false;
+    if (['running', 'queued', 'completed', 'solved', 'failed'].includes(status) && task.status !== status) return false;
     if (date) {
       const created = new Date(task.created_at);
       const ageMs = now.getTime() - created.getTime();
@@ -250,11 +310,52 @@ function filteredTasks() {
   });
 }
 
+function setSelectValue(selector, value) {
+  const select = $(selector);
+  if (!select || value === null) return;
+  const exists = Array.from(select.options).some((option) => option.value === value);
+  if (exists) select.value = value;
+}
+
+function loadFiltersFromURL() {
+  const params = new URLSearchParams(window.location.search);
+  setSelectValue('#filter-type', params.get('type'));
+  setSelectValue('#filter-status', params.get('status'));
+  setSelectValue('#filter-date', params.get('date'));
+}
+
+function syncFiltersToURL() {
+  if (!$('#task-cards')) return;
+  const params = new URLSearchParams(window.location.search);
+  [
+    ['type', $('#filter-type')?.value || ''],
+    ['status', $('#filter-status')?.value || ''],
+    ['date', $('#filter-date')?.value || ''],
+  ].forEach(([key, value]) => {
+    if (value) params.set(key, value);
+    else params.delete(key);
+  });
+  const query = params.toString();
+  const nextURL = `${window.location.pathname}${query ? `?${query}` : ''}`;
+  window.history.replaceState(null, '', nextURL);
+}
+
+function updateFilters() {
+  syncFiltersToURL();
+  renderCards();
+}
+
 async function submitTask(event) {
   event.preventDefault();
   const form = event.currentTarget;
   const status = $('#form-status');
+  const button = form.querySelector('button[type="submit"]');
+  const originalText = button?.textContent || '';
   status.textContent = '提交中';
+  if (button) {
+    button.disabled = true;
+    button.textContent = '提交中';
+  }
   try {
     const task = await fetchJSON('/api/tasks', {
       method: 'POST',
@@ -266,6 +367,11 @@ async function submitTask(event) {
     await loadCards();
   } catch (error) {
     status.textContent = error.message;
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = originalText || '提交题目';
+    }
   }
 }
 
@@ -280,21 +386,35 @@ async function loadTaskDetail() {
   const id = shell.dataset.taskId;
   const task = await fetchJSON(`/api/tasks/${encodeURIComponent(id)}`);
   $('#task-title').textContent = task.name;
+  document.title = `${task.name} - CTF Agent`;
   $('#task-status').outerHTML = statusBadge(task.status, 'task-status');
   $('#task-category').textContent = text(task.category);
   $('#task-target').textContent = text(task.target_ip);
   $('#task-attachments').textContent = text(task.attachment_count, '0');
-  $('#task-flag').textContent = text(task.flag);
   $('#task-error').textContent = text(task.error);
-  $('#task-writeup').innerHTML = task.status === 'solved' && task.has_writeup
-    ? `<a href="/api/tasks/${encodeURIComponent(task.id)}/writeup">下载${escapeHTML(task.writeup_file_name || 'wp.md')}</a>`
-    : '-';
   $('#task-container').textContent = task.container_kept
     ? `${task.container_name} 已保留`
     : (task.status === 'running' && task.container_name ? `${task.container_name} 运行中` : '未保留');
+  $('#task-flag').textContent = text(task.flag);
+  const writeup = $('#task-writeup');
+  if (writeup) {
+    writeup.innerHTML = task.has_writeup
+      ? `<a class="inline-link" href="/api/tasks/${encodeURIComponent(task.id)}/writeup">${escapeHTML(task.writeup_file_name || '下载WP')}</a>`
+      : '-';
+  }
+  updateStopTaskButton(task);
   updateOpenCodePanel(task);
   updateTerminalMessagePanel(task);
   $('#task-description').textContent = text(task.description, '');
+}
+
+function updateStopTaskButton(task) {
+  const button = $('#stop-task');
+  if (!button) return;
+  const canStop = task.status === 'queued' || task.status === 'running' || Boolean(task.container_kept);
+  button.disabled = !canStop;
+  button.dataset.taskName = task.name || task.id || '';
+  button.title = canStop ? '停止当前任务并销毁保留容器' : '当前任务不能停止';
 }
 
 function updateOpenCodePanel(task) {
@@ -333,8 +453,9 @@ async function loadLogs() {
   const logBox = $('#logs');
   if (!shell || !logBox) return;
   const id = shell.dataset.taskId;
-  const payload = await fetchJSON(`/api/tasks/${encodeURIComponent(id)}/logs`);
-  logBox.textContent = payload.logs || '';
+  const payload = await fetchJSON(`/api/tasks/${encodeURIComponent(id)}/logs?tail=${logTailBytes}`);
+  const logs = payload.logs || '';
+  logBox.textContent = renderLogWindow(logs, logs.length >= logTailBytes - 1);
   logBox.scrollTop = logBox.scrollHeight;
 }
 
@@ -347,13 +468,9 @@ async function followLogs() {
   const id = shell.dataset.taskId;
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   logBox.textContent = '连接实时日志中...\n';
-  socket = new WebSocket(`${protocol}//${window.location.host}/ws/tasks/${encodeURIComponent(id)}/logs`);
+  socket = new WebSocket(`${protocol}//${window.location.host}/ws/tasks/${encodeURIComponent(id)}/logs?tail=${logTailBytes}`);
   socket.onmessage = (event) => {
-    if (logBox.textContent === '连接实时日志中...\n') {
-      logBox.textContent = '';
-    }
-    logBox.textContent += event.data;
-    logBox.scrollTop = logBox.scrollHeight;
+    appendLogWindow(logBox, event.data);
   };
   socket.onclose = () => {
     socket = undefined;
@@ -370,24 +487,6 @@ function escapeHTML(value) {
   }[char]));
 }
 
-async function copyFlag(event) {
-  const button = event.currentTarget;
-  const flag = button.dataset.flag || '';
-  if (!flag) return;
-  try {
-    await navigator.clipboard.writeText(flag);
-    button.textContent = '已复制';
-    setTimeout(() => {
-      button.textContent = '复制Flag';
-    }, 1200);
-  } catch {
-    button.textContent = '复制失败';
-    setTimeout(() => {
-      button.textContent = '复制Flag';
-    }, 1200);
-  }
-}
-
 async function closeContainerFromCard(event) {
   event.preventDefault();
   event.stopPropagation();
@@ -395,6 +494,7 @@ async function closeContainerFromCard(event) {
   const taskID = button.dataset.taskId;
   if (!taskID) return;
   if (!confirmCloseContainer(button.dataset.taskName || taskID)) return;
+  const originalText = button.textContent;
   button.disabled = true;
   button.textContent = '销毁中';
   try {
@@ -403,12 +503,65 @@ async function closeContainerFromCard(event) {
     await loadContainers();
   } catch (error) {
     button.disabled = false;
-    button.textContent = error.message;
+    button.textContent = '销毁失败';
+    button.title = error.message;
+    setTimeout(() => {
+      button.textContent = originalText || '销毁容器';
+      button.title = '';
+    }, 1800);
+  }
+}
+
+async function stopCurrentTask() {
+  const shell = $('.detail-shell');
+  const button = $('#stop-task');
+  if (!shell || !button || button.disabled) return;
+  const name = button.dataset.taskName || shell.dataset.taskId;
+  if (!confirmCloseContainer(name)) return;
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = '停止中';
+  try {
+    await fetchJSON(`/api/tasks/${encodeURIComponent(shell.dataset.taskId)}/stop`, { method: 'POST' });
+    await loadTaskDetail();
+    await loadLogs().catch(() => {});
+  } catch (error) {
+    button.textContent = '停止失败';
+    button.title = error.message;
+    setTimeout(() => {
+      button.textContent = originalText || '停止任务';
+      button.title = '';
+      loadTaskDetail().catch(() => {});
+    }, 1800);
   }
 }
 
 function confirmCloseContainer(name) {
-  return window.confirm(`确认销毁${name}的容器吗？销毁后只能保留日志、已解出的WP和附件，不能继续这个运行现场。`);
+  return window.confirm(`确认销毁${name}的容器吗？销毁后只能保留日志和附件，不能继续这个运行现场。`);
+}
+
+async function clearHistoricalResults() {
+  const button = $('#clear-results');
+  if (!button) return;
+  if (!window.confirm('确认清理所有历史Flag/WP结果吗？日志、附件、容器和OpenCode会话不会删除。')) return;
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = '清理中';
+  try {
+    const result = await fetchJSON('/api/maintenance/clear-results', { method: 'POST' });
+    button.textContent = `已清理${result.tasks_updated || 0}项`;
+    await loadCards();
+    setTimeout(() => {
+      button.textContent = originalText || '清理历史结果';
+      button.disabled = false;
+    }, 1800);
+  } catch (error) {
+    button.textContent = error.message;
+    setTimeout(() => {
+      button.textContent = originalText || '清理历史结果';
+      button.disabled = false;
+    }, 2200);
+  }
 }
 
 async function sendMessage() {
@@ -422,7 +575,11 @@ async function sendMessage() {
     return;
   }
   const button = $('#send-message');
-  if (button) button.disabled = true;
+  const originalText = button?.textContent || '';
+  if (button) {
+    button.disabled = true;
+    button.textContent = '发送中';
+  }
   status.textContent = '已提交，正在继续OpenCode终端会话';
   try {
     await fetchJSON(`/api/tasks/${encodeURIComponent(shell.dataset.taskId)}/messages`, {
@@ -436,8 +593,18 @@ async function sendMessage() {
   } catch (error) {
     status.textContent = error.message;
   } finally {
-    if (button) button.disabled = false;
+    if (button) {
+      button.disabled = false;
+      button.textContent = originalText || '发送消息';
+    }
     await loadTaskDetail().catch(() => {});
+  }
+}
+
+function handleMessageKeydown(event) {
+  if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+    event.preventDefault();
+    sendMessage();
   }
 }
 
@@ -553,20 +720,24 @@ function setupTaskEvents() {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
+  loadFiltersFromURL();
   $('#task-form')?.addEventListener('submit', submitTask);
   $('#provider-format')?.addEventListener('change', updateProviderSettings);
   $('#refresh')?.addEventListener('click', loadCards);
+  $('#clear-results')?.addEventListener('click', clearHistoricalResults);
   $('#docker-refresh')?.addEventListener('click', loadContainers);
-  $('#filter-type')?.addEventListener('change', renderCards);
-  $('#filter-status')?.addEventListener('change', renderCards);
-  $('#filter-date')?.addEventListener('change', renderCards);
+  $('#filter-type')?.addEventListener('change', updateFilters);
+  $('#filter-status')?.addEventListener('change', updateFilters);
+  $('#filter-date')?.addEventListener('change', updateFilters);
   $('#load-logs')?.addEventListener('click', loadLogs);
   $('#follow-logs')?.addEventListener('click', followLogs);
   $('#clear-logs')?.addEventListener('click', () => {
     const logs = $('#logs');
     if (logs) logs.textContent = '';
   });
+  $('#stop-task')?.addEventListener('click', stopCurrentTask);
   $('#send-message')?.addEventListener('click', sendMessage);
+  $('#message-input')?.addEventListener('keydown', handleMessageKeydown);
   loadCards().catch((error) => {
     const cards = $('#task-cards');
     if (cards) cards.innerHTML = `<p class="muted">${escapeHTML(error.message)}</p>`;
