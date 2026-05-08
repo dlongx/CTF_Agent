@@ -29,7 +29,7 @@ if errorlevel 1 (
   exit /b 1
 )
 
-for /f "usebackq delims=" %%I in (`powershell -NoProfile -Command "$p=Get-Content -Raw '%WORK_DIR%\submit.json' | ConvertFrom-Json; $p.id"`) do set "TASK_ID=%%I"
+for /f "usebackq delims=" %%I in (`powershell -NoProfile -Command "$p=Get-Content -Raw -Encoding UTF8 '%WORK_DIR%\submit.json' | ConvertFrom-Json; $p.id"`) do set "TASK_ID=%%I"
 if "%TASK_ID%"=="" (
   echo [smoke] could not parse task id
   type "%WORK_DIR%\submit.json"
@@ -43,8 +43,8 @@ for /l %%I in (1,1,120) do (
     echo [smoke] task query failed
     exit /b 1
   )
-  for /f "usebackq delims=" %%S in (`powershell -NoProfile -Command "$p=Get-Content -Raw '%WORK_DIR%\task.json' | ConvertFrom-Json; $p.status"`) do set "TASK_STATUS=%%S"
-  for /f "usebackq delims=" %%F in (`powershell -NoProfile -Command "$p=Get-Content -Raw '%WORK_DIR%\task.json' | ConvertFrom-Json; $p.flag"`) do set "TASK_FLAG=%%F"
+  for /f "usebackq delims=" %%S in (`powershell -NoProfile -Command "$p=Get-Content -Raw -Encoding UTF8 '%WORK_DIR%\task.json' | ConvertFrom-Json; $p.status"`) do set "TASK_STATUS=%%S"
+  for /f "usebackq delims=" %%F in (`powershell -NoProfile -Command "$p=Get-Content -Raw -Encoding UTF8 '%WORK_DIR%\task.json' | ConvertFrom-Json; $p.flag"`) do set "TASK_FLAG=%%F"
   echo [smoke] status=!TASK_STATUS! flag=!TASK_FLAG!
   if "!TASK_STATUS!"=="solved" goto solved
   if "!TASK_STATUS!"=="failed" goto failed
