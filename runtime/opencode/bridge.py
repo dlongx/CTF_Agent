@@ -9,13 +9,16 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import re
+import signal
 import subprocess
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-MAX_SKILL_CHARS = 12000
 WORKSPACE_DIR = Path("/workspace")
 DEFAULT_EXEC_DIR = WORKSPACE_DIR / ".tmp"
 SOLVED_MARKER = "这道题目已经解出"
@@ -41,6 +44,8 @@ class BridgeConfig:
     user_hint: str
     session_id: str
     exec_dir: Path
+    run_timeout_seconds: float
+    idle_timeout_seconds: float
 
 
 def log(message: str) -> None:
@@ -67,7 +72,31 @@ def read_config() -> BridgeConfig:
         user_hint=os.getenv("CTF_AGENT_USER_HINT", "").strip(),
         session_id=os.getenv("OPENCODE_SESSION_ID", "").strip(),
         exec_dir=Path(os.getenv("CTF_AGENT_EXEC_DIR", str(DEFAULT_EXEC_DIR))),
+        run_timeout_seconds=parse_duration_seconds(
+            os.getenv("CTF_AGENT_OPENCODE_RUN_TIMEOUT", "20m"), 20 * 60
+        ),
+        idle_timeout_seconds=parse_duration_seconds(
+            os.getenv("CTF_AGENT_OPENCODE_IDLE_TIMEOUT", "5m"), 5 * 60
+        ),
     )
+
+
+def parse_duration_seconds(raw: str, fallback: float) -> float:
+    """Parse the subset of Go duration syntax used by the host config."""
+    value = raw.strip().lower()
+    if not value:
+        return fallback
+    units = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}
+    position = 0
+    total = 0.0
+    for match in re.finditer(r"(\d+(?:\.\d+)?)(ms|s|m|h)", value):
+        if match.start() != position:
+            return fallback
+        total += float(match.group(1)) * units[match.group(2)]
+        position = match.end()
+    if position != len(value) or total <= 0:
+        return fallback
+    return total
 
 
 def parse_skill_ids(raw: str) -> tuple[str, ...]:
@@ -81,7 +110,7 @@ def parse_skill_ids(raw: str) -> tuple[str, ...]:
 
 
 def configure_opencode(config: BridgeConfig) -> None:
-    """Write a transient OpenCode project config when model env vars are provided."""
+    """Provide an inline OpenCode config without persisting credentials."""
     if not config.provider_id and not config.model:
         raise RuntimeError(
             "OpenCode model is not configured. Set OPENCODE_PROVIDER_ID, "
@@ -107,7 +136,7 @@ def configure_opencode(config: BridgeConfig) -> None:
         "name": config.provider_name or config.provider_id,
         "options": {
             "baseURL": config.base_url,
-            "apiKey": config.api_key,
+            "apiKey": "{env:OPENCODE_API_KEY}",
         },
         "models": {
             config.model: {
@@ -125,13 +154,17 @@ def configure_opencode(config: BridgeConfig) -> None:
         },
     }
     WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
-    (WORKSPACE_DIR / "opencode.json").write_text(
-        json.dumps(opencode_config, ensure_ascii=False, indent=2),
-        encoding="utf-8",
+    legacy_config = WORKSPACE_DIR / "opencode.json"
+    if legacy_config.exists():
+        legacy_config.unlink()
+    os.environ["OPENCODE_CONFIG_CONTENT"] = json.dumps(
+        opencode_config, ensure_ascii=False, separators=(",", ":")
     )
+    os.environ["OPENCODE_DISABLE_AUTOUPDATE"] = "true"
+    os.environ["OPENCODE_DISABLE_MODELS_FETCH"] = "true"
     log(
-        "Thought: wrote OpenCode provider config "
-        f"provider={config.provider_id!r} model={config.model!r} base_url={config.base_url!r}."
+        "Thought: configured transient OpenCode provider "
+        f"provider={config.provider_id!r} model={config.model!r}."
     )
 
 
@@ -232,7 +265,9 @@ def read_skill_text(config: BridgeConfig) -> str:
     blocks = []
     loaded = []
     for skill_id in skill_ids_for_config(config):
-        skill_path = config.skills_dir / f"{skill_id}.md"
+        skill_path = config.skills_dir / skill_id / "SKILL.md"
+        if not skill_path.exists():
+            skill_path = config.skills_dir / f"{skill_id}.md"
         try:
             text = skill_path.read_text(encoding="utf-8")
         except OSError as exc:
@@ -242,8 +277,6 @@ def read_skill_text(config: BridgeConfig) -> str:
             )
             continue
         loaded.append(skill_id)
-        if len(text) > MAX_SKILL_CHARS:
-            text = text[:MAX_SKILL_CHARS] + "\n\n[skill truncated]\n"
         blocks.append(f"--- skill: {skill_id} ---\n{text.strip()}\n")
     if loaded:
         log(
@@ -480,67 +513,163 @@ def dedupe_preserve_order(values: list[str]) -> list[str]:
     return result
 
 
-def run_opencode_once(config: BridgeConfig, prompt: str, session_id: str) -> str:
-    """Run one OpenCode terminal command and return accumulated readable text."""
+def terminate_process(process: subprocess.Popen[Any]) -> None:
+    """Terminate the complete OpenCode process group with a bounded grace period."""
+    if process.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            process.terminate()
+        else:
+            os.killpg(process.pid, signal.SIGTERM)
+    except (OSError, ProcessLookupError):
+        process.terminate()
+    try:
+        process.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        if os.name == "nt":
+            process.kill()
+        else:
+            os.killpg(process.pid, signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        process.kill()
+    process.wait(timeout=5)
+
+
+def run_opencode_once(config: BridgeConfig, prompt: str, session_id: str) -> tuple[str, str]:
+    """Run one bounded OpenCode command and return output plus its session id."""
     workspace = WORKSPACE_DIR
     workspace.mkdir(parents=True, exist_ok=True)
     runtime_tmp = config.exec_dir
     runtime_tmp.mkdir(parents=True, exist_ok=True)
     os.environ["TMPDIR"] = str(runtime_tmp)
     os.environ["CTF_AGENT_EXEC_DIR"] = str(runtime_tmp)
+    prompt_path = runtime_tmp / "ctf-agent-prompt.md"
+    prompt_path.write_text(prompt, encoding="utf-8")
+    prompt_path.chmod(0o600)
     args = [
         "opencode",
         "run",
+        "按照附件中的任务说明继续执行。",
         "--format",
         "json",
         "--model",
         f"{config.provider_id}/{config.model}",
         "--title",
-        config.name,
+        "ctf-agent-task",
     ]
     if session_id:
         args.extend(["--session", session_id])
-    args.append(prompt)
+    args.extend(["--file", str(prompt_path)])
     log(
         "Action: run OpenCode terminal "
         f"model={config.provider_id}/{config.model} session={session_id or 'new'}"
     )
-    process = subprocess.Popen(
-        args,
-        cwd=str(workspace),
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        bufsize=1,
-    )
+    try:
+        process = subprocess.Popen(
+            args,
+            cwd=str(workspace),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=0,
+            start_new_session=True,
+        )
+    except Exception:
+        prompt_path.unlink(missing_ok=True)
+        raise
     blocks: list[str] = []
     seen_session = session_id
     last_preview = ""
+    started_at = time.monotonic()
+    last_output_at = started_at
     assert process.stdout is not None
-    for raw_line in process.stdout:
-        session_id, text = parse_terminal_event(raw_line, config)
-        if session_id and session_id != seen_session:
-            seen_session = session_id
-            log(f"Observation: OpenCode session={session_id}")
-        if not text:
-            continue
-        if text != last_preview:
-            log_delta_preview(text)
-            last_preview = text
-        blocks.append(text)
+    output_queue: queue.Queue[bytes | None] = queue.Queue()
+
+    def read_output() -> None:
+        try:
+            while True:
+                chunk = process.stdout.read(4096)
+                if not chunk:
+                    break
+                output_queue.put(chunk)
+        finally:
+            output_queue.put(None)
+
+    reader = threading.Thread(target=read_output, name="opencode-output", daemon=True)
+    reader.start()
+    pending = bytearray()
+    try:
+        while True:
+            now = time.monotonic()
+            if now - started_at >= config.run_timeout_seconds:
+                terminate_process(process)
+                raise RuntimeError("opencode run exceeded configured timeout")
+            if now - last_output_at >= config.idle_timeout_seconds:
+                terminate_process(process)
+                raise RuntimeError("opencode run exceeded configured idle timeout")
+            wait_for = min(
+                1.0,
+                config.run_timeout_seconds - (now - started_at),
+                config.idle_timeout_seconds - (now - last_output_at),
+            )
+            try:
+                chunk = output_queue.get(timeout=max(0.05, wait_for))
+            except queue.Empty:
+                if process.poll() is not None:
+                    break
+                continue
+            if chunk is None:
+                break
+            last_output_at = time.monotonic()
+            pending.extend(chunk)
+            while b"\n" in pending:
+                raw_line, _, remainder = pending.partition(b"\n")
+                pending = bytearray(remainder)
+                event_session_id, text = parse_terminal_event(
+                    raw_line.decode("utf-8", errors="replace"), config
+                )
+                if event_session_id and event_session_id != seen_session:
+                    seen_session = event_session_id
+                    log(f"Observation: OpenCode session={event_session_id}")
+                if not text:
+                    continue
+                if text != last_preview:
+                    log_delta_preview(text)
+                    last_preview = text
+                blocks.append(text)
+        if pending:
+            event_session_id, text = parse_terminal_event(
+                pending.decode("utf-8", errors="replace"), config
+            )
+            if event_session_id and event_session_id != seen_session:
+                seen_session = event_session_id
+                log(f"Observation: OpenCode session={event_session_id}")
+            if text:
+                if text != last_preview:
+                    log_delta_preview(text)
+                blocks.append(text)
+    finally:
+        prompt_path.unlink(missing_ok=True)
+        if process.poll() is None:
+            terminate_process(process)
+        reader.join(timeout=5)
+        process.stdout.close()
     exit_code = process.wait()
     final_text = "\n\n".join(dedupe_preserve_order(blocks)).strip()
     if exit_code != 0:
         raise RuntimeError(f"opencode run exited with status {exit_code}")
-    return final_text
+    return final_text, seen_session
 
 
-def run_opencode_terminal(config: BridgeConfig) -> str:
+def run_opencode_terminal(config: BridgeConfig) -> tuple[str, str]:
     """Run OpenCode and recover once if an existing session returns no text."""
     prompt = build_continuation_prompt(config) if config.session_id else build_prompt(config)
-    final_text = run_opencode_once(config, prompt, config.session_id)
+    final_text, session_id = run_opencode_once(config, prompt, config.session_id)
     if final_text or not config.session_id:
-        return final_text
+        return final_text, session_id
     log(
         "Observation: OpenCode session returned no readable output; "
         "retrying with a new recovery session"
@@ -548,7 +677,7 @@ def run_opencode_terminal(config: BridgeConfig) -> str:
     return run_opencode_once(config, build_session_recovery_prompt(config), "")
 
 
-def emit_final_output(_config: BridgeConfig, final_text: str) -> None:
+def emit_final_output(final_text: str) -> None:
     """Print the final readable output for the host log viewer."""
     log("Observation: final readable OpenCode output:")
     log(final_text[-12000:])
@@ -568,7 +697,7 @@ def extract_solved_flag(final_text: str) -> str:
     return ""
 
 
-def ensure_writeup(config: BridgeConfig, final_text: str) -> str:
+def ensure_writeup(config: BridgeConfig, final_text: str, session_id: str) -> str:
     """Ask OpenCode once to create the writeup when a solved run did not leave one."""
     if not extract_solved_flag(final_text):
         return ""
@@ -584,7 +713,7 @@ def ensure_writeup(config: BridgeConfig, final_text: str) -> str:
         "执行过的重要命令、关键输出、最终Flag，以及可复现步骤。"
     )
     try:
-        run_opencode_once(config, prompt, config.session_id)
+        run_opencode_once(config, prompt, session_id)
     except Exception as exc:
         log(f"Warning: failed to generate writeup: {exc}")
     if wp_path.exists() and wp_path.is_file() and wp_path.stat().st_size > 0:
@@ -600,13 +729,13 @@ def run_bridge() -> int:
     log(f"Thought: challenge={config.name!r} category={config.category!r}")
     try:
         configure_opencode(config)
-        final_text = run_opencode_terminal(config)
+        final_text, session_id = run_opencode_terminal(config)
         if not final_text:
             raise RuntimeError("OpenCode terminal finished without readable output")
-        ensure_writeup(config, final_text)
-        emit_final_output(config, final_text)
+        ensure_writeup(config, final_text, session_id)
+        emit_final_output(final_text)
     except Exception as exc:
-        log(f"Final: opencode bridge failed: {exc}")
+        log(f"Final: opencode bridge failed: {sanitize_log_text(str(exc), config)}")
         return 1
     log("Final: opencode bridge completed")
     return 0

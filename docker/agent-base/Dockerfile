@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.12.13-slim-trixie@sha256:423ed6ab25b1921a477529254bfeeabf5855151dc2c3141699a1bfc852199fbf
 
 ENV PYTHONUNBUFFERED=1
 ENV DEBIAN_FRONTEND=noninteractive
@@ -55,25 +55,23 @@ RUN apt-get -o Acquire::Retries=5 update \
         xxd \
     && rm -rf /var/lib/apt/lists/*
 
+COPY requirements.lock /tmp/requirements.lock
+
 RUN python -m pip install --no-cache-dir --upgrade \
-        pip \
-        setuptools \
-        wheel \
-    && python -m pip install --no-cache-dir \
-        beautifulsoup4 \
-        cryptography \
-        dnspython \
-        httpx \
-        lxml \
-        numpy \
-        Pillow \
-        pwntools \
-        pycryptodome \
-        python-magic \
-        requests \
-        scapy \
-        sympy \
-        z3-solver
+        pip==26.1.2 \
+        setuptools==83.0.0 \
+        wheel==0.47.0 \
+    && python -m pip install --no-cache-dir -r /tmp/requirements.lock \
+    && rm -f /tmp/requirements.lock
+
+RUN groupadd --gid 1000 ctf \
+    && useradd --uid 1000 --gid ctf --create-home --shell /bin/bash ctf \
+    && mkdir -p /workspace /home/ctf/.cache /home/ctf/.local/share/opencode \
+    && chown -R ctf:ctf /workspace /home/ctf \
+    && printf '%s\n' 'export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
+        > /etc/profile.d/ctf-agent-path.sh
+
+ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 WORKDIR /workspace
 

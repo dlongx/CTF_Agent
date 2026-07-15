@@ -10,8 +10,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 const dockerHostInternal = "host.docker.internal"
@@ -33,6 +35,7 @@ type DockerContainer struct {
 	Image   string
 	Status  string
 	Ports   string
+	Size    string
 	Running bool
 }
 
@@ -41,10 +44,11 @@ func ListDockerContainers() (map[string]DockerContainer, error) {
 		"docker",
 		"ps",
 		"-a",
+		"--size",
 		"--filter",
 		"name=ctf-agent-",
 		"--format",
-		"{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}",
+		"{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}\t{{.Size}}",
 	).CombinedOutput()
 	if err != nil {
 		message := strings.TrimSpace(string(output))
@@ -58,8 +62,8 @@ func ListDockerContainers() (map[string]DockerContainer, error) {
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
-		parts := strings.SplitN(line, "\t", 4)
-		for len(parts) < 4 {
+		parts := strings.SplitN(line, "\t", 5)
+		for len(parts) < 5 {
 			parts = append(parts, "")
 		}
 		name := strings.TrimSpace(parts[0])
@@ -72,10 +76,26 @@ func ListDockerContainers() (map[string]DockerContainer, error) {
 			Image:   strings.TrimSpace(parts[1]),
 			Status:  status,
 			Ports:   strings.TrimSpace(parts[3]),
+			Size:    strings.TrimSpace(parts[4]),
 			Running: strings.HasPrefix(strings.ToLower(status), "up "),
 		}
 	}
 	return containers, nil
+}
+
+func DockerContainerCreatedAt(containerName string) (time.Time, error) {
+	if !isManagedContainerName(containerName) {
+		return time.Time{}, errors.New("refusing unmanaged container name")
+	}
+	output, err := exec.Command("docker", "inspect", "--format", "{{.Created}}", containerName).CombinedOutput()
+	if err != nil {
+		return time.Time{}, errors.New(strings.TrimSpace(string(output)))
+	}
+	createdAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(string(output)))
+	if err != nil {
+		return time.Time{}, err
+	}
+	return createdAt, nil
 }
 
 func RunDockerTask(ctx context.Context, cfg Config, task *Task, logSink LogSink, containerSink func(string)) (DockerResult, error) {
@@ -103,6 +123,7 @@ func RunDockerTask(ctx context.Context, cfg Config, task *Task, logSink LogSink,
 	args = append(args,
 		"-v", dockerMount(cfg.AgentScript)+":/opt/ctf_agent/agent.py:ro",
 		"-v", dockerMount(cfg.SkillsDir)+":/skills:ro",
+		"-v", dockerMount(cfg.SkillsDir)+":/workspace/.opencode/skills:ro",
 		"-v", dockerMount(task.AttachmentsDir)+":/attachments:ro",
 		"-e", "CHALLENGE_NAME="+task.Name,
 		"-e", "CHALLENGE_TYPE="+task.Category,
@@ -225,6 +246,8 @@ func openCodeProviderEnv(cfg Config) []string {
 		"OPENCODE_BASE_URL=" + dockerReachableBaseURL(cfg.OpenCodeBaseURL),
 		"OPENCODE_API_KEY=" + cfg.OpenCodeAPIKey,
 		"OPENCODE_MODEL=" + cfg.OpenCodeModel,
+		"CTF_AGENT_OPENCODE_RUN_TIMEOUT=" + cfg.OpenCodeRunTimeout.String(),
+		"CTF_AGENT_OPENCODE_IDLE_TIMEOUT=" + cfg.OpenCodeIdleTimeout.String(),
 	}
 }
 
@@ -300,7 +323,7 @@ func runAgentInContainer(ctx context.Context, containerName string, env []string
 		}
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
-			logSink("[runner] agent exited with status=" + strconvItoa(exitErr.ExitCode()) + "\n")
+			logSink("[runner] agent exited with status=" + strconv.Itoa(exitErr.ExitCode()) + "\n")
 			return DockerResult{ExitCode: exitErr.ExitCode(), ContainerName: containerName}, nil
 		}
 		return DockerResult{ExitCode: 2, ContainerName: containerName}, err

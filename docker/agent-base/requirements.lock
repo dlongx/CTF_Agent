@@ -1,0 +1,14 @@
+beautifulsoup4==4.15.0
+cryptography==49.0.0
+dnspython==2.8.0
+httpx==0.28.1
+lxml==6.1.1
+numpy==2.5.1
+Pillow==12.3.0
+pwntools==4.15.0
+pycryptodome==3.23.0
+python-magic==0.4.27
+requests==2.34.2
+scapy==2.7.0
+sympy==1.14.0
+z3-solver==4.16.0.0

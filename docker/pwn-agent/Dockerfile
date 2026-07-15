@@ -1,5 +1,7 @@
 FROM ctf-agent-opencode:latest
 
+USER root
+
 ENV PYTHONUNBUFFERED=1
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TERM=xterm
@@ -47,18 +49,17 @@ RUN dpkg --add-architecture i386 \
         ruby-dev \
     && rm -rf /var/lib/apt/lists/*
 
-RUN python -m pip install --no-cache-dir \
-        capstone \
-        keystone-engine \
-        LibcSearcher \
-        ropper \
-        ROPGadget \
-        unicorn
+COPY requirements.lock /tmp/requirements.lock
+
+RUN python -m pip install --no-cache-dir -r /tmp/requirements.lock \
+    && rm -f /tmp/requirements.lock
 
 RUN gem install --no-document \
-        one_gadget \
-        seccomp-tools
+        one_gadget:1.10.0 \
+        seccomp-tools:1.6.2
 
 WORKDIR /workspace
+
+USER ctf
 
 CMD ["python", "/opt/ctf_agent/agent.py"]

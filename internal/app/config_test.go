@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNormalizeCategory(t *testing.T) {
@@ -12,6 +13,33 @@ func TestNormalizeCategory(t *testing.T) {
 
 	if got := normalizeCategory(" reverse-engineering "); got != "reverse_engineering" {
 		t.Fatalf("normalizeCategory()=%q", got)
+	}
+}
+
+func TestLoadConfigUsesBoundedRuntimeDefaults(t *testing.T) {
+	t.Setenv("CTF_AGENT_TASK_TIMEOUT", "")
+	t.Setenv("CTF_AGENT_AUTO_CONTINUE_ROUNDS", "")
+	t.Setenv("CTF_AGENT_OPENCODE_RUN_TIMEOUT", "")
+	t.Setenv("CTF_AGENT_OPENCODE_IDLE_TIMEOUT", "")
+	t.Setenv("CTF_AGENT_CONTAINER_RETENTION", "")
+	t.Setenv("CTF_AGENT_LOG_MAX_BYTES", "")
+
+	cfg := LoadConfig()
+	if cfg.TaskTimeout != 45*time.Minute || cfg.AutoContinueRounds != 6 {
+		t.Fatalf("task defaults timeout=%s rounds=%d", cfg.TaskTimeout, cfg.AutoContinueRounds)
+	}
+	if cfg.OpenCodeRunTimeout != 20*time.Minute || cfg.OpenCodeIdleTimeout != 5*time.Minute {
+		t.Fatalf("opencode defaults run=%s idle=%s", cfg.OpenCodeRunTimeout, cfg.OpenCodeIdleTimeout)
+	}
+	if cfg.ContainerRetention != 24*time.Hour || cfg.LogMaxBytes != 10<<20 {
+		t.Fatalf("maintenance defaults retention=%s log_max=%d", cfg.ContainerRetention, cfg.LogMaxBytes)
+	}
+}
+
+func TestAutoContinueRoundsAcceptsZero(t *testing.T) {
+	t.Setenv("CTF_AGENT_AUTO_CONTINUE_ROUNDS", "0")
+	if got := LoadConfig().AutoContinueRounds; got != 0 {
+		t.Fatalf("AutoContinueRounds=%d want 0", got)
 	}
 }
 
@@ -73,7 +101,7 @@ func TestLoadConfigDefaultsRuntimePaths(t *testing.T) {
 }
 
 func TestLoadConfigReadsLocalOpenCodeEnvFile(t *testing.T) {
-	root := t.TempDir()
+	root := tempDirWithRemoveRetry(t)
 	previous, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("Getwd: %v", err)

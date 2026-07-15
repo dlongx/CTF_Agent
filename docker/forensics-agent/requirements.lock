@@ -1,0 +1,12 @@
+construct==2.10.70
+hachoir==3.3.0
+matplotlib==3.11.0
+oletools==0.60.2
+opencv-python-headless==5.0.0.93
+pylibdmtx==0.1.10
+pySSTV==0.5.8
+pytesseract==0.3.13
+pyshark==0.6
+scipy==1.18.0
+stegpy==0.2.0
+volatility3==2.28.0

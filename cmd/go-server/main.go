@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -13,13 +13,16 @@ import (
 )
 
 func main() {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
 	cfg := app.LoadConfig()
 	if err := cfg.ValidateServerSecurity(); err != nil {
-		log.Fatalf("invalid server security config: %v", err)
+		slog.Error("invalid server security config", "error", err)
+		os.Exit(1)
 	}
 	service, err := app.NewService(cfg)
 	if err != nil {
-		log.Fatalf("create service: %v", err)
+		slog.Error("create service", "error", err)
+		os.Exit(1)
 	}
 	defer service.Close()
 
@@ -28,22 +31,28 @@ func main() {
 		Addr:              cfg.Addr,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	serverErrors := make(chan error, 1)
 	go func() {
-		log.Printf("Go CTF Agent backend listening on http://%s", cfg.Addr)
+		slog.Info("CTF Agent backend listening", "addr", cfg.Addr)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("listen: %v", err)
+			serverErrors <- err
 		}
 	}()
 
-	<-ctx.Done()
+	select {
+	case <-ctx.Done():
+	case err := <-serverErrors:
+		slog.Error("HTTP server stopped unexpectedly", "error", err)
+	}
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
-		log.Printf("shutdown: %v", err)
+		slog.Error("HTTP server shutdown", "error", err)
 	}
 }

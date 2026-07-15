@@ -1,5 +1,7 @@
 FROM ctf-agent-opencode:latest
 
+USER root
+
 ENV PYTHONUNBUFFERED=1
 ENV DEBIAN_FRONTEND=noninteractive
 ENV ANDROID_STUBS_ARM64=/opt/android-stubs/arm64-v8a
@@ -32,6 +34,7 @@ RUN apt-get -o Acquire::Retries=5 update \
         gcc-aarch64-linux-gnu \
         g++ \
         iputils-ping \
+        libsmali-java \
         make \
         qemu-user \
         qemu-user-binfmt \
@@ -69,6 +72,7 @@ RUN set -eux; \
     make install; \
     ldconfig; \
     r2 -v; \
+    rabin2 -v; \
     rm -rf /tmp/radare2.tar.xz /tmp/radare2-src
 
 RUN set -eux; \
@@ -96,26 +100,14 @@ RUN set -eux; \
     aarch64-linux-gnu-gcc -shared -fPIC -nostdlib -Wl,-soname,libandroid.so -o "${ANDROID_STUBS_ARM64}/libandroid.so" /tmp/libandroid_stub.c; \
     rm -f /tmp/liblog_stub.c /tmp/libandroid_stub.c
 
-RUN python -m pip install --no-cache-dir \
-        angr \
-        androguard \
-        angrop \
-        capstone \
-        frida-tools \
-        keystone-engine \
-        lief \
-        opencv-python-headless \
-        objection \
-        pylibdmtx \
-        pysstv \
-        pytesseract \
-        qiling \
-        r2pipe \
-        scipy \
-        unicorn \
-        uncompyle6 \
-        z3-solver
+COPY requirements.lock /tmp/requirements.lock
+
+RUN python -m pip install --no-cache-dir -r /tmp/requirements.lock \
+    && python -m pip check \
+    && rm -f /tmp/requirements.lock
 
 WORKDIR /workspace
+
+USER ctf
 
 CMD ["python", "/opt/ctf_agent/agent.py"]

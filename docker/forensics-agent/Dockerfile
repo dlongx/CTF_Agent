@@ -1,5 +1,7 @@
 FROM ctf-agent-opencode:latest
 
+USER root
+
 ENV PYTHONUNBUFFERED=1
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -46,22 +48,15 @@ RUN apt-get -o Acquire::Retries=10 -o Acquire::http::Pipeline-Depth=0 -o Acquire
         tshark \
     && rm -rf /var/lib/apt/lists/*
 
-RUN python -m pip install --no-cache-dir \
-        construct \
-        hachoir \
-        matplotlib \
-        oletools \
-        opencv-python-headless \
-        pylibdmtx \
-        pysstv \
-        pytesseract \
-        pyshark \
-        scipy \
-        stegpy \
-        volatility3
+COPY requirements.lock /tmp/requirements.lock
 
-RUN gem install --no-document zsteg
+RUN python -m pip install --no-cache-dir -r /tmp/requirements.lock \
+    && rm -f /tmp/requirements.lock
+
+RUN gem install --no-document zsteg:0.2.14
 
 WORKDIR /workspace
+
+USER ctf
 
 CMD ["python", "/opt/ctf_agent/agent.py"]

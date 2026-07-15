@@ -6,25 +6,46 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
 type Store struct {
-	root  string
-	mu    sync.RWMutex
-	tasks map[string]*Task
+	root          string
+	mu            sync.RWMutex
+	tasks         map[string]*Task
+	logMaxBytes   int64
+	logMaxBackups int
 }
 
 const (
 	containerClosedMessage = "容器已关闭"
 	taskStoppedMessage     = "任务已停止"
 	taskTimeoutMessage     = "任务执行超时"
+	currentTaskSchema      = 1
+	defaultLogMaxBytes     = int64(10 << 20)
+	defaultLogMaxBackups   = 3
 )
 
 func NewStore(root string) (*Store, error) {
-	store := &Store{root: root, tasks: map[string]*Task{}}
+	return NewStoreWithOptions(root, defaultLogMaxBytes, defaultLogMaxBackups)
+}
+
+func NewStoreWithOptions(root string, logMaxBytes int64, logMaxBackups int) (*Store, error) {
+	if logMaxBytes <= 0 {
+		logMaxBytes = defaultLogMaxBytes
+	}
+	if logMaxBackups < 0 {
+		logMaxBackups = 0
+	}
+	store := &Store{
+		root:          root,
+		tasks:         map[string]*Task{},
+		logMaxBytes:   logMaxBytes,
+		logMaxBackups: logMaxBackups,
+	}
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return nil, err
 	}
@@ -64,8 +85,14 @@ func (s *Store) Add(task *Task) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.tasks[task.ID] = task
-	return s.writeTask(task)
+	copy := *task
+	copy.SchemaVersion = currentTaskSchema
+	if err := s.writeTask(&copy); err != nil {
+		return err
+	}
+	s.tasks[task.ID] = &copy
+	*task = copy
+	return nil
 }
 
 func (s *Store) Get(id string) (*Task, bool) {
@@ -104,6 +131,9 @@ func (s *Store) AppendLog(id string, text string) error {
 		return errors.New("task not found")
 	}
 	logPath := filepath.Join(s.root, id, "logs.txt")
+	if err := s.rotateLogIfNeeded(logPath, int64(len([]byte(text)))); err != nil {
+		return err
+	}
 	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		return err
@@ -113,21 +143,54 @@ func (s *Store) AppendLog(id string, text string) error {
 		return err
 	}
 	task.LogSize += len([]byte(text))
-	return s.writeTask(task)
+	return nil
 }
 
 func (s *Store) Logs(id string) (string, bool) {
 	if _, ok := s.Get(id); !ok {
 		return "", false
 	}
-	data, err := os.ReadFile(filepath.Join(s.root, id, "logs.txt"))
-	if err != nil {
-		if os.IsNotExist(err) {
-			return "", true
+	base := filepath.Join(s.root, id, "logs.txt")
+	var blocks []string
+	for index := s.logMaxBackups; index >= 1; index-- {
+		data, err := os.ReadFile(base + "." + strconv.Itoa(index))
+		if err == nil {
+			blocks = append(blocks, string(data))
+		} else if !os.IsNotExist(err) {
+			return "", false
 		}
+	}
+	data, err := os.ReadFile(base)
+	if err == nil {
+		blocks = append(blocks, string(data))
+	} else if !os.IsNotExist(err) {
 		return "", false
 	}
-	return string(data), true
+	return strings.Join(blocks, ""), true
+}
+
+func (s *Store) rotateLogIfNeeded(path string, incomingBytes int64) error {
+	if s.logMaxBytes <= 0 || s.logMaxBackups <= 0 {
+		return nil
+	}
+	stat, err := os.Stat(path)
+	if os.IsNotExist(err) || (err == nil && stat.Size()+incomingBytes <= s.logMaxBytes) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	_ = os.Remove(path + "." + strconv.Itoa(s.logMaxBackups))
+	for index := s.logMaxBackups - 1; index >= 1; index-- {
+		oldPath := path + "." + strconv.Itoa(index)
+		newPath := path + "." + strconv.Itoa(index+1)
+		_ = os.Remove(newPath)
+		if err := os.Rename(oldPath, newPath); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	_ = os.Remove(path + ".1")
+	return os.Rename(path, path+".1")
 }
 
 func (s *Store) MarkRunning(id string) error {
@@ -179,7 +242,7 @@ func (s *Store) MarkFinishedWithFailureMessage(id string, exitCode int, flag *st
 			if failureMessage != "" {
 				task.Error = &failureMessage
 			} else if task.Error == nil {
-				msg := "runner exited with status " + strconvItoa(exitCode)
+				msg := "runner exited with status " + strconv.Itoa(exitCode)
 				task.Error = &msg
 			}
 		}
@@ -272,7 +335,7 @@ func (s *Store) SaveWriteup(id string, filename string, content string) error {
 	if !ok {
 		return errors.New("task not found")
 	}
-	if err := os.WriteFile(filepath.Join(s.root, id, filename), []byte(content), 0o644); err != nil {
+	if err := atomicWriteFile(filepath.Join(s.root, id, filename), []byte(content), 0o644); err != nil {
 		return err
 	}
 	task.WriteupFileName = filename
@@ -419,8 +482,14 @@ func (s *Store) update(id string, fn func(*Task)) error {
 	if !ok {
 		return errors.New("task not found")
 	}
-	fn(task)
-	return s.writeTask(task)
+	copy := *task
+	fn(&copy)
+	copy.SchemaVersion = currentTaskSchema
+	if err := s.writeTask(&copy); err != nil {
+		return err
+	}
+	s.tasks[id] = &copy
+	return nil
 }
 
 func (s *Store) writeTask(task *Task) error {
@@ -437,23 +506,53 @@ func (s *Store) writeTask(task *Task) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(s.root, task.ID, "meta.json"), data, 0o644)
+	path := filepath.Join(s.root, task.ID, "meta.json")
+	if current, err := os.ReadFile(path); err == nil && json.Valid(current) {
+		if err := atomicWriteFile(path+".bak", current, 0o644); err != nil {
+			return err
+		}
+	}
+	return atomicWriteFile(path, data, 0o644)
 }
 
 func (s *Store) readTask(dir string, dirID string) (*Task, error) {
-	data, err := os.ReadFile(filepath.Join(dir, "meta.json"))
+	path := filepath.Join(dir, "meta.json")
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
 	var task Task
 	if err := json.Unmarshal(data, &task); err != nil {
-		return nil, err
+		backup, backupErr := os.ReadFile(path + ".bak")
+		if backupErr != nil {
+			return nil, err
+		}
+		if backupErr = json.Unmarshal(backup, &task); backupErr != nil {
+			return nil, err
+		}
+		data = backup
+		if backupErr = atomicWriteFile(path, backup, 0o644); backupErr != nil {
+			return nil, backupErr
+		}
 	}
 	if task.ID == "" {
 		return nil, errors.New("missing task id")
 	}
 	if !isSafeTaskID(task.ID) || task.ID != dirID {
 		return nil, errors.New("invalid task id")
+	}
+	if task.SchemaVersion > currentTaskSchema {
+		return nil, errors.New("unsupported task schema version")
+	}
+	if task.SchemaVersion == 0 {
+		task.SchemaVersion = currentTaskSchema
+		migrated, marshalErr := json.MarshalIndent(&task, "", "  ")
+		if marshalErr != nil {
+			return nil, marshalErr
+		}
+		if err := atomicWriteFile(path, migrated, 0o644); err != nil {
+			return nil, err
+		}
 	}
 	if task.AttachmentsDir == "" {
 		task.AttachmentsDir = filepath.Join(dir, "attachments")
@@ -467,28 +566,6 @@ func (s *Store) readTask(dir string, dirID string) (*Task, error) {
 		task.ContainerKept = false
 	}
 	return &task, nil
-}
-
-func strconvItoa(value int) string {
-	if value == 0 {
-		return "0"
-	}
-	negative := value < 0
-	if negative {
-		value = -value
-	}
-	buf := make([]byte, 0, 12)
-	for value > 0 {
-		buf = append(buf, byte('0'+value%10))
-		value /= 10
-	}
-	if negative {
-		buf = append(buf, '-')
-	}
-	for i, j := 0, len(buf)-1; i < j; i, j = i+1, j-1 {
-		buf[i], buf[j] = buf[j], buf[i]
-	}
-	return string(buf)
 }
 
 func stringPtr(value string) *string {

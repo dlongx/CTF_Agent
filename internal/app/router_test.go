@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -382,7 +383,7 @@ func TestCreateTaskReturnsTooManyRequestsWhenQueueFull(t *testing.T) {
 	service := newTestService(t)
 	service.Close()
 	for i := 0; i < cap(service.queue); i++ {
-		service.queue <- "blocked-" + strconvItoa(i)
+		service.queue <- "blocked-" + strconv.Itoa(i)
 	}
 	server := httptest.NewServer(NewRouter(service))
 	defer server.Close()
@@ -460,7 +461,7 @@ func TestSetProviderFormatKeepsActiveFormatWhenPersistFails(t *testing.T) {
 
 	service := newTestService(t)
 	defer service.Close()
-	blocker := filepath.Join(t.TempDir(), "provider-state-blocker")
+	blocker := filepath.Join(tempDirWithRemoveRetry(t), "provider-state-blocker")
 	if err := os.WriteFile(blocker, []byte("not a directory"), 0o644); err != nil {
 		t.Fatalf("write blocker: %v", err)
 	}
@@ -476,7 +477,7 @@ func TestSetProviderFormatKeepsActiveFormatWhenPersistFails(t *testing.T) {
 
 func TestServicePrefersExplicitProviderFormatEnvOverSavedState(t *testing.T) {
 	t.Setenv("OPENCODE_PROVIDER_FORMAT", ProviderFormatOpenAICompatible)
-	dataDir := t.TempDir()
+	dataDir := tempDirWithRemoveRetry(t)
 	if err := os.WriteFile(
 		filepath.Join(dataDir, "provider.json"),
 		[]byte(`{"format":"anthropic"}`),
@@ -681,7 +682,7 @@ func TestRemovedOpenCodeRoute(t *testing.T) {
 
 func newTestService(t *testing.T) *Service {
 	t.Helper()
-	dataDir := t.TempDir()
+	dataDir := tempDirWithRemoveRetry(t)
 	providers := map[string]OpenCodeProviderConfig{
 		ProviderFormatOpenAICompatible: {
 			Format:       ProviderFormatOpenAICompatible,

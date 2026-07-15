@@ -177,14 +177,14 @@ call :verify_commands ctf-agent-base:latest "bash curl wget unzip 7z xz file rg 
 call :verify_image ctf-agent-opencode:latest "requests,bs4,cryptography,lxml,pwn,Crypto,z3,httpx,dns.resolver,numpy,PIL,scapy,sympy,magic" || exit /b 1
 call :verify_image ctf-agent-web:latest "jwt,jose,flask_unsign,websockets,aiohttp,requests_toolbelt,websocket" || exit /b 1
 call :verify_commands ctf-agent-web:latest "sqlmap dirb gobuster nikto whatweb wafw00f mitmproxy tshark whois go ping traceroute" || exit /b 1
-call :verify_image ctf-agent-misc:latest "pyzbar,qrcode,dnslib,pymodbus,stegpy,scipy,cv2,pytesseract,pylibdmtx,pysstv" || exit /b 1
-call :verify_commands ctf-agent-misc:latest "ffmpeg sox zbarimg qrencode exiftool pngcheck steghide outguess tshark 7z unrar-free binwalk tesseract dmtxread ping traceroute" || exit /b 1
+call :verify_image ctf-agent-misc:latest "pyzbar,qrcode,dnslib,pymodbus,stegpy,scipy,cv2,pytesseract,pylibdmtx,pysstv,pdfplumber,fitz" || exit /b 1
+call :verify_commands ctf-agent-misc:latest "ffmpeg sox zbarimg qrencode exiftool pngcheck steghide outguess tshark 7z unar unrar pdfinfo pdftotext binwalk tesseract dmtxread ping traceroute" || exit /b 1
 call :verify_image ctf-agent-crypto:latest "gmpy2,fpylll,ecdsa,py_ecc,libnum,owiener,primefac" || exit /b 1
 call :verify_commands ctf-agent-crypto:latest "openssl john hashcat gp" || exit /b 1
 call :verify_image ctf-agent-pwn:latest "pwn,capstone,keystone,unicorn,ropper,LibcSearcher" || exit /b 1
 call :verify_commands ctf-agent-pwn:latest "checksec gdb gdb-multiarch gdbserver strace ltrace file readelf objdump eu-readelf xxd nc socat nmap patchelf qemu-x86_64 qemu-system-x86_64 cpio busybox" || exit /b 1
 call :verify_image ctf-agent-reverse:latest "angr,lief,qiling,frida_tools,capstone,unicorn,androguard,angrop,objection,r2pipe,scipy,cv2,pytesseract,pylibdmtx,pysstv" || exit /b 1
-call :verify_commands ctf-agent-reverse:latest "apktool jadx adb fastboot aapt apksigner zipalign gcc g++ aarch64-linux-gnu-gcc readelf objdump eu-readelf file xxd unzip zip upx wine wine64 qemu-i386 qemu-x86_64 r2 radare2 tesseract ping traceroute" || exit /b 1
+call :verify_commands ctf-agent-reverse:latest "apktool baksmali smali jadx adb fastboot aapt apksigner zipalign gcc g++ aarch64-linux-gnu-gcc readelf objdump eu-readelf file xxd unzip zip upx wine wine64 qemu-i386 qemu-x86_64 r2 radare2 rabin2 tesseract ping traceroute" || exit /b 1
 call :verify_image ctf-agent-forensics:latest "volatility3,construct,pyshark,hachoir,oletools,stegpy,scipy,cv2,pytesseract,pylibdmtx,pysstv" || exit /b 1
 call :verify_commands ctf-agent-forensics:latest "binwalk foremost exiftool pngcheck zbarimg qrencode steghide outguess ffmpeg sox convert 7z unrar-free john tshark tcpdump pcapfix pdfinfo fls zsteg tesseract dmtxread ping traceroute" || exit /b 1
 exit /b 0

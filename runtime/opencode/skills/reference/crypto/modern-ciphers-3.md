@@ -1,6 +1,6 @@
 # CTF Crypto - Modern Cipher Attacks (Part 3)
 
-Custom hash reversal, CRC brute-force, noisy RSA oracles, sponge collisions, CBC/padding oracle tricks, SPN recovery, AES-CFB, three-round XOR, Unicode side channels, SHA-256 basis attacks, MAC forgery, HMAC bit oracles. For Blum-Goldwasser, hash length extension, compression oracles, OFB/HMAC-CRC/DES weak keys, SRP, square attack, AES-ECB/CBC oracles, Rabin, PBKDF2, and MD5 multi-collision, see [modern-ciphers-2.md](modern-ciphers-2.md).
+Custom hash reversal, CRC brute-force, noisy RSA oracles, sponge collisions, CBC/padding oracle tricks, SPN recovery, AES-CFB, three-round XOR, Unicode side channels, SHA-256 basis attacks, MAC forgery, HMAC bit oracles. For Blum-Goldwasser, hash length extension, compression oracles, OFB/HMAC-CRC/DES weak keys, SRP, square attack, AES-ECB/CBC oracles, Rabin, PBKDF2, and MD5 multi-collision, see [modern-ciphers-2.md](../../crypto/references/modern-ciphers-2.md).
 
 ## Table of Contents
 - [Custom Hash State Reversal via Known Intermediates (BackdoorCTF 2016)](#custom-hash-state-reversal-via-known-intermediates-backdoorctf-2016)
@@ -450,4 +450,4 @@ buf[offset] ^= ord('0') ^ ord('1')             # 0x30 ^ 0x31 = 0x01
 forged_cookie = b64encode(bytes(buf)).decode()
 ```
 
-**Key insight:** In AES-CBC, `P_{n+1} = AES_dec(C_{n+1}) XOR C_n`. Flipping byte `i` of `C_n` flips byte `i` of `P_{n+1}` with zero side effects on `P_{n+1}`, but turns `P_n` (which was `AES_dec(C_n) XOR C_{n-1}`) into pseudo-random garbage. Works whenever the server (a) uses CBC without integrity checks, (b) parses the JSON/cookie leniently enough to tolerate a corrupted earlier block (unknown-key field, ignored garbage, lenient JSON parser), and (c) exposes the block boundary offset of the target byte. Contrast with [AES-CBC IV Bit-Flip (Google CTF 2016)](modern-ciphers-2.md#aes-cbc-iv-bit-flip-authentication-bypass-google-ctf-2016), which targets block 0 by flipping the IV and leaves all later blocks intact.
+**Key insight:** In AES-CBC, `P_{n+1} = AES_dec(C_{n+1}) XOR C_n`. Flipping byte `i` of `C_n` flips byte `i` of `P_{n+1}` with zero side effects on `P_{n+1}`, but turns `P_n` (which was `AES_dec(C_n) XOR C_{n-1}`) into pseudo-random garbage. Works whenever the server (a) uses CBC without integrity checks, (b) parses the JSON/cookie leniently enough to tolerate a corrupted earlier block (unknown-key field, ignored garbage, lenient JSON parser), and (c) exposes the block boundary offset of the target byte. Contrast with [AES-CBC IV Bit-Flip (Google CTF 2016)](../../crypto/references/modern-ciphers-2.md#aes-cbc-iv-bit-flip-authentication-bypass-google-ctf-2016), which targets block 0 by flipping the IV and leaves all later blocks intact.

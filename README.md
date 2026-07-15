@@ -1,300 +1,125 @@
-# AI驱动的CTF自动化解题平台
+# CTF_Agent
 
-这是一个OpenCode驱动的CTF自动化解题平台。当前项目已经收敛为单一Go后端、Gin+HTML前端和Docker隔离执行层：用户提交题目和附件，Go后端持久化任务、调度Docker容器、按需读取日志文件，容器内通过`opencode run --format json`执行Agent解题。
+CTF_Agent是一个面向个人本机部署的AI驱动CTF自动化解题平台。用户提交题目与附件后，Go服务负责持久化和排队，Docker为每个任务创建隔离环境，容器内OpenCode通过Python桥接脚本调用用户配置的模型Provider。
 
-## 当前能力
+项目选择继续维护现有Go单体，而不是重写。当前范围刻意保持克制:原生HTML/ES Modules前端、文件存储、单机Docker，不引入Vue、SQLite、微服务、RBAC或公网多租户。
 
-- Go后端:兼容REST API和WebSocket日志流，支持任务队列、并发Worker、任务恢复和文件持久化。
-- Gin+HTML前端:任务提交、题目卡片列表、单题大屏、按需读取logs.txt和实时跟随。
-- Docker调度:按题型选择镜像，限制CPU/内存/进程数，成功出Flag后销毁容器，未解出时保留容器供继续解题。
-- OpenCode执行层:每个任务容器内运行`opencode run --format json`，根据题型生成Prompt并把可读事件输出到任务日志。
+## 功能
 
-## 目录结构
+- REST API、WebSocket实时日志和无构建步骤的原生前端。
+- goroutineWorker队列、并发上限、总任务/单轮/无输出超时及可靠关闭。
+- web、pwn、crypto、reverse、forensics、misc题型镜像。
+- OpenCode同一session自动续跑和人工继续，自动续跑最多6轮。
+- 元数据原子写入、`.bak`恢复、版本迁移和任务日志轮转。
+- 存活、就绪、Provider连通性和Docker容器诊断。
+- 本地假Provider端到端烟测，不消耗真实模型额度。
 
-```text
-cmd/go-server/             # Go后端入口
-internal/app/              # API、任务队列、Docker调度、WebSocket、存储
-web/templates/             # Gin HTML模板
-web/static/                # 内置前端CSS和JS
-docker/agent-base/         # 通用CTF工具基础镜像
-docker/opencode-agent/     # OpenCode执行镜像
-docker/web-agent/          # Web题轻量专用镜像
-docker/pwn-agent/          # Pwn题轻量专用镜像
-docker/crypto-agent/       # Crypto题轻量专用镜像
-docker/reverse-agent/      # Reverse题轻量专用镜像
-docker/forensics-agent/    # Forensics题轻量专用镜像
-docker/misc-agent/         # Misc题轻量专用镜像
-runtime/opencode/          # 容器内OpenCode运行时桥接层
-runtime/opencode/skills/   # 内置CTF题型Skill和参考资料
-docs/                      # 架构和执行层文档
-data/challenges/           # 本地任务数据，运行时生成
-```
+## 快速开始
 
-## 构建镜像
+需要Go1.25或1.26、DockerDesktop、Python3.12+、Node.js。首次构建:
 
-先构建基础镜像：
-
-```bat
-docker build --pull=false -t ctf-agent-base:latest docker/agent-base
-```
-
-再构建OpenCode镜像：
-
-```bat
+```powershell
+docker build --pull -t ctf-agent-base:latest docker/agent-base
 docker build -t ctf-agent-opencode:latest docker/opencode-agent
-```
-
-构建所有轻量题型专用镜像：
-
-```bat
-docker-build-light.bat
-```
-
-构建后可以执行镜像依赖自检：
-
-```bat
-docker-build-light.bat verify
-```
-
-也可以按需单独构建：
-
-```bat
-docker build -t ctf-agent-web:latest docker/web-agent
-docker build -t ctf-agent-pwn:latest docker/pwn-agent
-docker build -t ctf-agent-crypto:latest docker/crypto-agent
-docker build -t ctf-agent-reverse:latest docker/reverse-agent
-docker build -t ctf-agent-forensics:latest docker/forensics-agent
 docker build -t ctf-agent-misc:latest docker/misc-agent
 ```
 
-如需切换npm源：
+复制`opencode.env.example`为不提交到Git的`opencode.env`，填写一组Provider配置，然后启动:
 
-```bat
-docker build -t ctf-agent-opencode:latest docker/opencode-agent ^
-  --build-arg NPM_REGISTRY=https://registry.npmjs.org
+```powershell
+./start-dev.bat --restart
 ```
 
-## 启动开发环境
+打开`http://127.0.0.1:8000`。只运行服务可使用`go run ./cmd/go-server`。
 
-根目录运行：
+## 确定性检查
 
-```bat
-start-dev.bat --restart
+```powershell
+./scripts/check-all.ps1
+./scripts/smoke-fake-provider.ps1
 ```
 
-脚本会启动：
+`check-all.ps1`执行格式、依赖一致性、单测、vet、构建、Python、JavaScript及Markdown链接检查。LinuxCI额外执行`go test -race ./...`和`govulncheck ./...`。真实Provider烟测仅在发布前运行:
+
+```powershell
+./smoke-opencode.bat
+```
+
+假Provider烟测是确定性的；真实烟测依赖外部Provider，失败不会触发静默切换。
+
+## 配置
+
+常用服务配置:
+
+|变量|默认值|说明|
+|---|---:|---|
+|`CTF_AGENT_GO_ADDR`|`127.0.0.1:8000`|监听地址|
+|`CTF_AGENT_ACCESS_TOKEN`|空|非回环监听时必填|
+|`CTF_AGENT_ALLOWED_ORIGINS`|空|明确允许的跨域来源|
+|`CTF_AGENT_DATA_DIR`|`data`|本地数据根目录|
+|`CTF_AGENT_MAX_CONTAINERS`|`4`|Worker和运行容器上限|
+|`CTF_AGENT_TASK_TIMEOUT`|`45m`|任务总超时|
+|`CTF_AGENT_OPENCODE_RUN_TIMEOUT`|`20m`|单次OpenCode运行超时|
+|`CTF_AGENT_OPENCODE_IDLE_TIMEOUT`|`5m`|OpenCode无输出超时|
+|`CTF_AGENT_AUTO_CONTINUE_ROUNDS`|`6`|自动续跑轮数，`0`表示不续跑|
+|`CTF_AGENT_CONTAINER_RETENTION`|`24h`|未解出容器保留时间|
+|`CTF_AGENT_LOG_MAX_BYTES`|`10485760`|单份任务日志上限，保留3份归档|
+|`CTF_AGENT_MEM_LIMIT`|`512m`|单容器内存限制|
+|`CTF_AGENT_CPUS`|`1.0`|单容器CPU限制|
+|`CTF_AGENT_PIDS_LIMIT`|`1024`|单容器进程数限制|
+|`CTF_AGENT_DISABLE_NETWORK`|`false`|关闭任务容器网络|
+
+镜像可用`CTF_AGENT_DOCKER_IMAGE`设置默认值，并用`CTF_AGENT_IMAGE_WEB`等题型变量覆盖。完整变量和Provider格式见[开发指南](docs/DEVELOPMENT.md)。
+
+API Key只由服务环境传入一次执行进程。桥接层通过`OPENCODE_CONFIG_CONTENT`和`{env:OPENCODE_API_KEY}`引用Key，不写入任务工作区；长Prompt通过权限为`0600`的临时文件传给OpenCode，不进入进程参数。
+
+## 数据与任务状态
 
 ```text
-Web UI和API: http://127.0.0.1:8000
+data/
+  provider.json
+  challenges/{task_id}/
+    meta.json
+    meta.json.bak
+    logs.txt
+    logs.txt.1 ... logs.txt.3
+    attachments/
+    *_wp.md
 ```
 
-`--restart`会清理占用`8000`的旧开发进程。
+现有任务状态名保持兼容:`queued`、`running`、`solved`、`completed`、`failed`。到达自动续跑上限的任务进入`completed`并保留容器；同一任务并发继续返回HTTP409，队列满返回HTTP429。详细约定见[数据模型](docs/DATA_MODEL.md)和[API文档](docs/API.md)。
 
-只启动服务：
+备份和恢复前应停止服务，避免跨文件时间点不一致:
 
-```bat
-go run ./cmd/go-server
+```powershell
+./scripts/backup-data.ps1
+./scripts/restore-data.ps1 -Archive ./backups/ctf-agent-data-YYYYMMDD-HHMMSS.zip
 ```
 
-## API
+恢复会校验每个文件的SHA-256，并把原数据目录保留为带时间戳的`.previous-*`目录。
 
-提交任务：
-
-```bash
-curl -X POST http://127.0.0.1:8000/api/tasks \
-  -F "name=demo" \
-  -F "type=misc" \
-  -F "description=scan attachment" \
-  -F "target_ip=127.0.0.1" \
-  -F "attachments=@./challenge.txt"
-```
-
-查询任务：
-
-```bash
-curl http://127.0.0.1:8000/api/tasks
-curl http://127.0.0.1:8000/api/tasks/{task_id}
-curl http://127.0.0.1:8000/api/tasks/{task_id}/logs
-```
-
-继续保留容器中的OpenCode终端会话：
-
-```bash
-curl -X POST http://127.0.0.1:8000/api/tasks/{task_id}/messages \
-  -H "Content-Type: application/json" \
-  -d "{\"message\":\"继续检查这个方向\"}"
-```
-
-实时日志：
+## 项目结构
 
 ```text
-ws://127.0.0.1:8000/ws/tasks/{task_id}/logs
+cmd/go-server/             Go服务入口
+cmd/fake-provider/         确定性测试Provider
+internal/app/              配置、API、队列、存储、Docker和WebSocket
+web/templates/             HTML模板
+web/static/                CSS和原生ES Modules
+docker/*-agent/            分层Docker镜像
+runtime/opencode/bridge.py 容器内Agent入口
+runtime/opencode/skills/   OpenCode原生Skills和引用资料
+scripts/                   检查、烟测、备份和恢复
+docs/                      架构、开发、运维、接口、ADR和路线图
 ```
 
-页面入口：
+## 维护入口
 
-```text
-http://127.0.0.1:8000/             # 题目卡片列表和提交表单
-http://127.0.0.1:8000/tasks/{id}   # 单题大屏
-```
+- 新维护者先读[AGENTS.md](AGENTS.md)和[开发指南](docs/DEVELOPMENT.md)。
+- 系统边界与数据流见[架构文档](docs/ARCHITECTURE.md)。
+- 部署、诊断、清理与恢复见[运维手册](docs/OPERATIONS.md)。
+- 任务状态的唯一来源是[路线图](docs/ROADMAP.md)。
+- 设计取舍记录在[ADR目录](docs/adr/README.md)。
+- 安全问题按[安全策略](SECURITY.md)报告。
 
-## 任务数据
-
-任务会持久化到：
-
-```text
-data/challenges/{task_id}/
-  meta.json       # 任务名称、题型、状态、Flag、退出码等元数据
-  logs.txt        # 容器stdout/stderr实时日志
-  attachments/    # 用户上传的题目附件
-```
-
-Go后端启动时会扫描`data/challenges/*/meta.json`，状态为`queued`或`running`的任务会重新入队。
-
-## 配置项
-
-```text
-CTF_AGENT_GO_ADDR=127.0.0.1:8000
-CTF_AGENT_ACCESS_TOKEN=
-CTF_AGENT_ALLOWED_ORIGINS=
-CTF_AGENT_DATA_DIR=data
-CTF_AGENT_DOCKER_IMAGE=ctf-agent-opencode:latest
-CTF_AGENT_IMAGE_WEB=ctf-agent-web:latest
-CTF_AGENT_IMAGE_PWN=ctf-agent-pwn:latest
-CTF_AGENT_IMAGE_CRYPTO=ctf-agent-crypto:latest
-CTF_AGENT_IMAGE_REVERSE=ctf-agent-reverse:latest
-CTF_AGENT_IMAGE_FORENSICS=ctf-agent-forensics:latest
-CTF_AGENT_IMAGE_MISC=ctf-agent-misc:latest
-CTF_AGENT_CATEGORY_IMAGES=web=ctf-agent-web:latest,pwn=ctf-agent-pwn:latest
-CTF_AGENT_MEM_LIMIT=512m
-CTF_AGENT_CPUS=1.0
-CTF_AGENT_MAX_CONTAINERS=4
-CTF_AGENT_TASK_TIMEOUT=0
-CTF_AGENT_AUTO_CONTINUE_ROUNDS=6
-CTF_AGENT_PIDS_LIMIT=1024
-CTF_AGENT_DISABLE_NETWORK=false
-CTF_AGENT_AGENT_SCRIPT=runtime/opencode/bridge.py
-CTF_AGENT_SKILLS_DIR=runtime/opencode/skills
-OPENCODE_PROVIDER_FORMAT=openai-compatible
-OPENCODE_OPENAI_PROVIDER_ID=ctf
-OPENCODE_OPENAI_PROVIDER_NAME=CTF Model Gateway
-OPENCODE_OPENAI_PROVIDER_NPM=@ai-sdk/openai-compatible
-OPENCODE_OPENAI_BASE_URL=https://your-model-gateway.example/v1
-OPENCODE_OPENAI_API_KEY=your-openai-compatible-key
-OPENCODE_OPENAI_MODEL=gpt-5.2
-OPENCODE_ANTHROPIC_PROVIDER_ID=anthropic
-OPENCODE_ANTHROPIC_PROVIDER_NAME=Anthropic
-OPENCODE_ANTHROPIC_PROVIDER_NPM=@ai-sdk/anthropic
-OPENCODE_ANTHROPIC_BASE_URL=https://api.anthropic.com/v1
-OPENCODE_ANTHROPIC_API_KEY=your-anthropic-key
-OPENCODE_ANTHROPIC_MODEL=claude-sonnet-4-5
-```
-
-`CTF_AGENT_TASK_TIMEOUT`默认`0`，表示不设置单题总时长超时；也可以设置为Go duration格式，例如`30m`、`2h`。任务会运行到解出Flag、容器内Agent退出、达到超时，或用户在任务详情页点击停止任务/Docker管理页手动销毁容器。
-
-`CTF_AGENT_AUTO_CONTINUE_ROUNDS`控制自动续跑轮数，默认`6`。当OpenCode一轮正常结束但没有输出合法Flag，并且容器和OpenCode session仍可用时，后端会自动向同一session发送继续解题提示；用完轮数仍未解出时才标记为`failed`并保留容器供手动继续。
-
-如果把`CTF_AGENT_GO_ADDR`改成`0.0.0.0:8000`、`:8000`或其他非回环地址，必须配置`CTF_AGENT_ACCESS_TOKEN`。浏览器访问页面时把该值作为HTTP Basic Auth密码；API客户端可使用`Authorization: Bearer <token>`。`CTF_AGENT_ALLOWED_ORIGINS`为空时不输出跨域头，只支持同源访问；需要跨域时填写明确来源，例如`https://ctf.example`，多个来源用英文逗号分隔。
-
-`ctf-agent-opencode:latest`同时安装`@ai-sdk/openai-compatible`和`@ai-sdk/anthropic`。前端“模型接口格式”只切换当前使用哪一组配置，不接收、不展示API Key；Key仍来自`opencode.env`。切换后只影响新启动或继续运行时新执行的容器，不会改变已经启动的容器。
-
-镜像选择规则：
-
-```text
-1.优先读取CTF_AGENT_IMAGE_{TYPE}，例如CTF_AGENT_IMAGE_PWN
-2.也支持CTF_AGENT_CATEGORY_IMAGES=web=xxx,pwn=yyy
-3.没有题型专用镜像时，回退到CTF_AGENT_DOCKER_IMAGE
-```
-
-## OpenCode执行模型
-
-每个任务都会创建一个全新的Docker容器。容器内运行`runtime/opencode/bridge.py`：
-
-```text
-1.读取题目环境变量和/attachments附件目录
-2.生成/workspace/opencode.json
-3.根据题型生成CTF解题Prompt
-4.执行opencode run --format json --model provider/model --title <task>
-5.从JSON事件流提取sessionID、可读文本和工具输出
-6.把OpenCode日志和结果输出到stdout
-```
-
-后端只捕获容器stdout/stderr，不直接调用模型供应商接口。模型协议、Key和权限策略交给OpenCode配置处理。
-
-Flag提取规则：
-
-```text
-1.优先精确匹配一行“这道题目已经解出”
-2.捕获该标记的下一整行作为Flag，该行不能为空
-3.没有两行协议时不会伪造Flag，会继续同一OpenCode session或标记本轮未解出
-```
-
-因此Prompt会强制要求OpenCode解出后按以下两行收尾：
-
-```text
-这道题目已经解出
-<exact flag>
-```
-
-未解出但容器保留时，任务详情页终端下方可以发送消息继续同一个OpenCodesession；当前回合运行中不能插话。
-
-详细规则见[Flag提取逻辑](docs/flag-extraction.md)。
-
-## 真实链路烟测
-
-后端启动、模型配置和Docker镜像准备好后，可以运行：
-
-```bat
-smoke-opencode.bat
-```
-
-脚本会向`http://127.0.0.1:8000`提交一个最小misc题，等待OpenCode读取附件中的`flag{ctf_agent_smoke_ok}`，并验证任务状态、Flag和WP下载。若服务不在默认地址，设置：
-
-```bat
-set CTF_AGENT_SMOKE_URL=http://127.0.0.1:8000
-smoke-opencode.bat
-```
-
-## 内置Skills
-
-内置CTF Skill位于：
-
-```text
-runtime/opencode/skills/
-  crypto.md
-  web.md
-  pwn.md
-  reverse.md
-  forensics.md
-  misc.md
-  reference/
-```
-
-Go后端会把`runtime/opencode/skills`只读挂载到容器内`/skills`，并传入：
-
-```text
-CTF_AGENT_SKILLS_DIR=/skills
-CTF_AGENT_SKILL_IDS={题型}
-```
-
-`runtime/opencode/bridge.py`会按题型读取对应Skill并拼入OpenCode Prompt。单个Skill默认最多注入12000字符，避免Prompt过大。
-
-## 安全边界
-
-```text
-每个任务一个全新容器
-附件只读挂载到/attachments
-容器CPU、内存和进程数受限
-模型Provider环境变量只在执行Agent的docker exec阶段注入，不写入长期保留容器的创建配置
-成功出Flag后自动删除容器
-未解出任务容器会保留，用户可在终端下方发送消息继续同一OpenCodesession，或在Docker管理页手动销毁
-后端不启动、不暴露旧Web端口
-```
-
-## 自动检查
-
-```bat
-go test ./...
-go build ./cmd/go-server
-python -m py_compile runtime/opencode/bridge.py
-```
+本项目使用[MIT许可证](LICENSE)。

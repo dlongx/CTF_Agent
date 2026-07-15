@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,10 +10,31 @@ import (
 	"time"
 )
 
+func tempDirWithRemoveRetry(t *testing.T) string {
+	t.Helper()
+	root, err := os.MkdirTemp("", "ctf-agent-test-")
+	if err != nil {
+		t.Fatalf("create temporary directory: %v", err)
+	}
+	t.Cleanup(func() {
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			if err := os.RemoveAll(root); err == nil {
+				return
+			} else if time.Now().After(deadline) {
+				t.Errorf("remove temporary directory: %v", err)
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	})
+	return root
+}
+
 func TestStorePersistsTaskAndLogs(t *testing.T) {
 	t.Parallel()
 
-	root := t.TempDir()
+	root := tempDirWithRemoveRetry(t)
 	store, err := NewStore(root)
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
@@ -54,7 +76,7 @@ func TestStorePersistsTaskAndLogs(t *testing.T) {
 func TestStoreRejectsUnsafeTaskID(t *testing.T) {
 	t.Parallel()
 
-	store, err := NewStore(t.TempDir())
+	store, err := NewStore(tempDirWithRemoveRetry(t))
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
@@ -77,7 +99,7 @@ func TestStoreRejectsUnsafeTaskID(t *testing.T) {
 func TestMarkFlagCompletesRunningTaskMetadata(t *testing.T) {
 	t.Parallel()
 
-	store, err := NewStore(t.TempDir())
+	store, err := NewStore(tempDirWithRemoveRetry(t))
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
@@ -111,7 +133,7 @@ func TestMarkFlagCompletesRunningTaskMetadata(t *testing.T) {
 func TestStoreSkipsMismatchedTaskIDOnLoad(t *testing.T) {
 	t.Parallel()
 
-	root := t.TempDir()
+	root := tempDirWithRemoveRetry(t)
 	taskDir := filepath.Join(root, "task-dir")
 	if err := os.MkdirAll(taskDir, 0o755); err != nil {
 		t.Fatalf("mkdir task dir: %v", err)
@@ -133,7 +155,7 @@ func TestStoreSkipsMismatchedTaskIDOnLoad(t *testing.T) {
 func TestStoreRecoverableIDs(t *testing.T) {
 	t.Parallel()
 
-	root := t.TempDir()
+	root := tempDirWithRemoveRetry(t)
 	store, err := NewStore(root)
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
@@ -166,7 +188,7 @@ func TestStoreRecoverableIDs(t *testing.T) {
 func TestStoreMarksFlaggedTaskSolvedRegardlessOfExitCode(t *testing.T) {
 	t.Parallel()
 
-	root := t.TempDir()
+	root := tempDirWithRemoveRetry(t)
 	store, err := NewStore(root)
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
@@ -192,10 +214,47 @@ func TestStoreMarksFlaggedTaskSolvedRegardlessOfExitCode(t *testing.T) {
 	}
 }
 
+func TestStoreInvalidAndInterruptedResultTransitions(t *testing.T) {
+	t.Parallel()
+	store, err := NewStore(tempDirWithRemoveRetry(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"invalid", "false-live", "interrupted"} {
+		if err := store.Add(&Task{ID: id, Name: id, Status: StatusRunning, CreatedAt: time.Now().UTC()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.MarkInvalidFlag("invalid", "invalid flag"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkFalseLiveCapture("false-live", "false capture"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkInterruptedContainerRetained("interrupted"); err != nil {
+		t.Fatal(err)
+	}
+	invalid, _ := store.Get("invalid")
+	falseLive, _ := store.Get("false-live")
+	interrupted, _ := store.Get("interrupted")
+	if invalid.Status != StatusFailed || invalid.Flag != nil || invalid.ContainerKept {
+		t.Fatalf("invalid=%+v", invalid)
+	}
+	if falseLive.Status != StatusFailed || !falseLive.ContainerKept || falseLive.ExitCode != nil {
+		t.Fatalf("false live=%+v", falseLive)
+	}
+	if interrupted.Status != StatusFailed || !interrupted.ContainerKept || interrupted.FinishedAt == nil {
+		t.Fatalf("interrupted=%+v", interrupted)
+	}
+	if err := store.MarkFalseLiveCapture("../bad", "bad"); err == nil {
+		t.Fatal("unsafe false capture ID was accepted")
+	}
+}
+
 func TestStoreHidesWriteupForUnsolvedTask(t *testing.T) {
 	t.Parallel()
 
-	root := t.TempDir()
+	root := tempDirWithRemoveRetry(t)
 	store, err := NewStore(root)
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
@@ -224,7 +283,7 @@ func TestStoreHidesWriteupForUnsolvedTask(t *testing.T) {
 func TestStoreRejectsUnsafeWriteupFilename(t *testing.T) {
 	t.Parallel()
 
-	root := t.TempDir()
+	root := tempDirWithRemoveRetry(t)
 	store, err := NewStore(root)
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
@@ -252,7 +311,7 @@ func TestStoreRejectsUnsafeWriteupFilename(t *testing.T) {
 func TestAppendLogDoesNotSolveRunningTaskFromAssistantUpdate(t *testing.T) {
 	t.Parallel()
 
-	root := t.TempDir()
+	root := tempDirWithRemoveRetry(t)
 	store, err := NewStore(root)
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
@@ -292,7 +351,7 @@ flag{a91b0bbf-e6fd-42dd-b9a6-5ef4f2bc695f}`
 func TestRunTaskExtractsFlagOnlyFromFinalReadableOutput(t *testing.T) {
 	t.Parallel()
 
-	root := t.TempDir()
+	root := tempDirWithRemoveRetry(t)
 	store, err := NewStore(root)
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
@@ -346,7 +405,7 @@ func TestManagedContainerNameValidation(t *testing.T) {
 func TestStoreMarksRunningTaskFailedWhenContainerClosed(t *testing.T) {
 	t.Parallel()
 
-	root := t.TempDir()
+	root := tempDirWithRemoveRetry(t)
 	store, err := NewStore(root)
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
@@ -375,7 +434,7 @@ func TestStoreMarksRunningTaskFailedWhenContainerClosed(t *testing.T) {
 func TestStoreLoadsFlaggedFailedTaskAsSolved(t *testing.T) {
 	t.Parallel()
 
-	root := t.TempDir()
+	root := tempDirWithRemoveRetry(t)
 	flag := "flag{loaded}"
 	store, err := NewStore(root)
 	if err != nil {
@@ -408,7 +467,7 @@ func TestStoreLoadsFlaggedFailedTaskAsSolved(t *testing.T) {
 func TestStorePersistsOpenCodeSession(t *testing.T) {
 	t.Parallel()
 
-	root := t.TempDir()
+	root := tempDirWithRemoveRetry(t)
 	store, err := NewStore(root)
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
@@ -436,7 +495,7 @@ func TestStorePersistsOpenCodeSession(t *testing.T) {
 func TestStoreLoadsLegacyWebMetadata(t *testing.T) {
 	t.Parallel()
 
-	root := t.TempDir()
+	root := tempDirWithRemoveRetry(t)
 	taskDir := filepath.Join(root, "legacy-web")
 	if err := os.MkdirAll(taskDir, 0o755); err != nil {
 		t.Fatalf("mkdir task dir: %v", err)
@@ -490,7 +549,7 @@ func TestOpenCodeStateReportsBridgeFailure(t *testing.T) {
 func TestCloseQueuedTaskStopsBeforeWorkerRuns(t *testing.T) {
 	t.Parallel()
 
-	root := t.TempDir()
+	root := tempDirWithRemoveRetry(t)
 	store, err := NewStore(root)
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
@@ -524,7 +583,7 @@ func TestCloseQueuedTaskStopsBeforeWorkerRuns(t *testing.T) {
 func TestRunTaskMarksTimeout(t *testing.T) {
 	t.Parallel()
 
-	root := t.TempDir()
+	root := tempDirWithRemoveRetry(t)
 	store, err := NewStore(root)
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
@@ -561,7 +620,7 @@ func TestRunTaskMarksTimeout(t *testing.T) {
 func TestRunTaskAutoContinuesUntilSolved(t *testing.T) {
 	t.Parallel()
 
-	root := t.TempDir()
+	root := tempDirWithRemoveRetry(t)
 	store, err := NewStore(root)
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
@@ -606,10 +665,125 @@ func TestRunTaskAutoContinuesUntilSolved(t *testing.T) {
 	}
 }
 
+func TestRunTaskStopsAtAutoContinueLimit(t *testing.T) {
+	t.Parallel()
+
+	store, err := NewStore(tempDirWithRemoveRetry(t))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	task := &Task{
+		ID:          "auto-limit",
+		Name:        "auto-limit",
+		Category:    "misc",
+		Description: "continue",
+		Status:      StatusQueued,
+		CreatedAt:   time.Now().UTC(),
+	}
+	if err := store.Add(task); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	service := &Service{
+		cfg:   Config{AutoContinueRounds: 2},
+		store: store,
+		hub:   NewHub(),
+		done:  make(chan struct{}),
+		runs:  map[string]context.CancelFunc{},
+	}
+	service.runDockerTask = func(_ context.Context, _ Config, task *Task, logSink LogSink, containerSink func(string)) (DockerResult, error) {
+		containerSink("ctf-agent-" + task.ID)
+		logSink("Observation: OpenCode session=ses_limit\n")
+		return DockerResult{ExitCode: 0, ContainerName: "ctf-agent-" + task.ID, Retained: true}, nil
+	}
+	hints := 0
+	service.runDockerHint = func(_ context.Context, _ Config, task *Task, _ string, _ LogSink) (DockerResult, error) {
+		hints++
+		return DockerResult{ExitCode: 0, ContainerName: task.ContainerName, Retained: true}, nil
+	}
+
+	service.runTask(0, task.ID)
+
+	got, _ := store.Get(task.ID)
+	if hints != 2 {
+		t.Fatalf("auto-continue hints=%d want 2", hints)
+	}
+	if got.Status != StatusCompleted || !got.ContainerKept {
+		t.Fatalf("task should complete unsolved at limit: %+v", got)
+	}
+	logs, _ := store.Logs(task.ID)
+	if !strings.Contains(logs, "auto-continue limit reached rounds=2") {
+		t.Fatalf("limit log missing:\n%s", logs)
+	}
+}
+
+func TestStoreRecoversCorruptMetadataFromBackup(t *testing.T) {
+	t.Parallel()
+
+	root := tempDirWithRemoveRetry(t)
+	store, err := NewStore(root)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	task := &Task{ID: "backup-recovery", Status: StatusQueued, CreatedAt: time.Now().UTC()}
+	if err := store.Add(task); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := store.MarkRunning(task.ID); err != nil {
+		t.Fatalf("MarkRunning: %v", err)
+	}
+	if err := store.MarkFailed(task.ID, "failed"); err != nil {
+		t.Fatalf("MarkFailed: %v", err)
+	}
+	metaPath := filepath.Join(root, task.ID, "meta.json")
+	if err := os.WriteFile(metaPath, []byte("{broken"), 0o644); err != nil {
+		t.Fatalf("corrupt metadata: %v", err)
+	}
+
+	reloaded, err := NewStore(root)
+	if err != nil {
+		t.Fatalf("reload store: %v", err)
+	}
+	got, ok := reloaded.Get(task.ID)
+	if !ok || got.Status != StatusRunning || got.SchemaVersion != currentTaskSchema {
+		t.Fatalf("backup was not restored: %+v ok=%v", got, ok)
+	}
+	if data, err := os.ReadFile(metaPath); err != nil || !json.Valid(data) {
+		t.Fatalf("primary metadata was not repaired: err=%v data=%q", err, data)
+	}
+}
+
+func TestStoreRotatesLogsAndPreservesOrder(t *testing.T) {
+	t.Parallel()
+
+	root := tempDirWithRemoveRetry(t)
+	store, err := NewStoreWithOptions(root, 10, 2)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	task := &Task{ID: "log-rotation", Status: StatusQueued, CreatedAt: time.Now().UTC()}
+	if err := store.Add(task); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	for _, line := range []string{"first1\n", "second\n", "third3\n"} {
+		if err := store.AppendLog(task.ID, line); err != nil {
+			t.Fatalf("AppendLog: %v", err)
+		}
+	}
+	logs, ok := store.Logs(task.ID)
+	if !ok || logs != "first1\nsecond\nthird3\n" {
+		t.Fatalf("rotated logs=%q ok=%v", logs, ok)
+	}
+	for _, suffix := range []string{".1", ".2"} {
+		if _, err := os.Stat(filepath.Join(root, task.ID, "logs.txt"+suffix)); err != nil {
+			t.Fatalf("missing rotated log %s: %v", suffix, err)
+		}
+	}
+}
+
 func TestRunTaskStopsAutoContinueOnHardFailure(t *testing.T) {
 	t.Parallel()
 
-	root := t.TempDir()
+	root := tempDirWithRemoveRetry(t)
 	store, err := NewStore(root)
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
@@ -657,7 +831,7 @@ func TestRunTaskStopsAutoContinueOnHardFailure(t *testing.T) {
 func TestRunTaskAutoContinueCanBeStoppedByUser(t *testing.T) {
 	t.Parallel()
 
-	root := t.TempDir()
+	root := tempDirWithRemoveRetry(t)
 	store, err := NewStore(root)
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)

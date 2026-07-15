@@ -21,6 +21,10 @@ type Config struct {
 	MaxContainers          int
 	TaskTimeout            time.Duration
 	AutoContinueRounds     int
+	OpenCodeRunTimeout     time.Duration
+	OpenCodeIdleTimeout    time.Duration
+	ContainerRetention     time.Duration
+	LogMaxBytes            int64
 	PidsLimit              string
 	DisableNetwork         bool
 	AccessToken            string
@@ -73,8 +77,12 @@ func LoadConfig() Config {
 		MemLimit:               getenv("CTF_AGENT_MEM_LIMIT", "512m"),
 		CPUs:                   getenv("CTF_AGENT_CPUS", "1.0"),
 		MaxContainers:          getenvInt("CTF_AGENT_MAX_CONTAINERS", 4),
-		TaskTimeout:            getenvDuration("CTF_AGENT_TASK_TIMEOUT", 0),
-		AutoContinueRounds:     getenvInt("CTF_AGENT_AUTO_CONTINUE_ROUNDS", 6),
+		TaskTimeout:            getenvDuration("CTF_AGENT_TASK_TIMEOUT", 45*time.Minute),
+		AutoContinueRounds:     getenvNonNegativeInt("CTF_AGENT_AUTO_CONTINUE_ROUNDS", 6),
+		OpenCodeRunTimeout:     getenvDuration("CTF_AGENT_OPENCODE_RUN_TIMEOUT", 20*time.Minute),
+		OpenCodeIdleTimeout:    getenvDuration("CTF_AGENT_OPENCODE_IDLE_TIMEOUT", 5*time.Minute),
+		ContainerRetention:     getenvDuration("CTF_AGENT_CONTAINER_RETENTION", 24*time.Hour),
+		LogMaxBytes:            getenvInt64("CTF_AGENT_LOG_MAX_BYTES", 10<<20),
 		PidsLimit:              getenv("CTF_AGENT_PIDS_LIMIT", "1024"),
 		DisableNetwork:         getenvBool("CTF_AGENT_DISABLE_NETWORK", false),
 		AccessToken:            strings.TrimSpace(os.Getenv("CTF_AGENT_ACCESS_TOKEN")),
@@ -256,6 +264,26 @@ func getenv(name string, fallback string) string {
 
 func getenvInt(name string, fallback int) int {
 	value, err := strconv.Atoi(strings.TrimSpace(os.Getenv(name)))
+	if err != nil || value <= 0 {
+		return fallback
+	}
+	return value
+}
+
+func getenvNonNegativeInt(name string, fallback int) int {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < 0 {
+		return fallback
+	}
+	return parsed
+}
+
+func getenvInt64(name string, fallback int64) int64 {
+	value, err := strconv.ParseInt(strings.TrimSpace(os.Getenv(name)), 10, 64)
 	if err != nil || value <= 0 {
 		return fallback
 	}

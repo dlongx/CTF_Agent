@@ -1,0 +1,12 @@
+dnslib==0.9.26
+opencv-python-headless==5.0.0.93
+pdfplumber==0.11.10
+pymupdf==1.28.0
+pymodbus==3.14.0
+pylibdmtx==0.1.10
+pySSTV==0.5.8
+pytesseract==0.3.13
+pyzbar==0.1.9
+qrcode==8.2
+scipy==1.18.0
+stegpy==0.2.0

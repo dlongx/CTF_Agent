@@ -1,5 +1,7 @@
 FROM ctf-agent-opencode:latest
 
+USER root
+
 ENV PYTHONUNBUFFERED=1
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -39,31 +41,24 @@ RUN git clone --filter=blob:none https://github.com/sullo/nikto.git /opt/nikto \
     && ln -sf /opt/nikto/program/nikto.pl /usr/local/bin/nikto \
     && chmod +x /usr/local/bin/nikto
 
-RUN PYCURL_SSL_LIBRARY=openssl python -m pip install --no-cache-dir \
-        chardet==7.4.3 \
-        aiohttp==3.13.5 \
-        flask-unsign==1.2.1 \
-        itsdangerous==2.2.0 \
-        Jinja2==3.1.6 \
-        pycurl==7.46.0 \
-        pyparsing==3.3.2 \
-        mitmproxy==12.2.2 \
-        PyJWT==2.12.1 \
-        python-jose==3.5.0 \
-        requests-toolbelt==1.0.0 \
-        six==1.17.0 \
-        sqlmap==1.10.3 \
-        websocket-client==1.9.0 \
-        websockets==16.0
+COPY requirements.lock /tmp/requirements.lock
 
-RUN python -m pip install --no-cache-dir "pip<24.1" \
+RUN PYCURL_SSL_LIBRARY=openssl python -m pip install --no-cache-dir -r /tmp/requirements.lock \
+    && rm -f /tmp/requirements.lock
+
+RUN python -m pip install --no-cache-dir pip==24.0 \
     && python -m pip install --no-cache-dir --no-deps \
         wfuzz==3.1.0 \
+    && sed -i 's/pyparsing (>=2\.4\*)/pyparsing (>=2.4)/' \
+        /usr/local/lib/python3.12/site-packages/wfuzz-3.1.0.dist-info/METADATA \
     && python -m pip install --no-cache-dir --upgrade \
-        pip \
-        setuptools \
-        wheel
+        pip==26.1.2 \
+        setuptools==83.0.0 \
+        wheel==0.47.0 \
+    && python -m pip check
 
 WORKDIR /workspace
+
+USER ctf
 
 CMD ["python", "/opt/ctf_agent/agent.py"]

@@ -1,0 +1,9 @@
+cysignals==1.12.6
+ecdsa==0.19.2
+fpylll==0.6.4
+gmpy2==2.3.1
+hashpumpy==1.2
+libnum==1.7.1
+owiener==1.0.10
+primefac==2.0.12
+py_ecc==8.0.0

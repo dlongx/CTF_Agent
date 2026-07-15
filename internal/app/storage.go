@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -57,7 +58,7 @@ func saveUploadedFile(header *multipart.FileHeader, dst string) error {
 	ext := filepath.Ext(name)
 	stem := strings.TrimSuffix(name, ext)
 	for i := 1; fileExists(target); i++ {
-		target = filepath.Join(dst, stem+"-"+strconvItoa(i)+ext)
+		target = filepath.Join(dst, stem+"-"+strconv.Itoa(i)+ext)
 	}
 
 	output, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)

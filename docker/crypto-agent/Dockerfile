@@ -1,5 +1,7 @@
 FROM ctf-agent-opencode:latest
 
+USER root
+
 ENV PYTHONUNBUFFERED=1
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -17,21 +19,18 @@ RUN apt-get -o Acquire::Retries=5 update \
         libgmp-dev \
         libmpc-dev \
         libmpfr-dev \
+        libssl-dev \
         openssl \
         pari-gp \
     && rm -rf /var/lib/apt/lists/*
 
-RUN python -m pip install --no-cache-dir \
-        cysignals \
-        ecdsa \
-        fpylll \
-        gmpy2 \
-        hashpumpy \
-        libnum \
-        owiener \
-        primefac \
-        py_ecc
+COPY requirements.lock /tmp/requirements.lock
+
+RUN python -m pip install --no-cache-dir -r /tmp/requirements.lock \
+    && rm -f /tmp/requirements.lock
 
 WORKDIR /workspace
+
+USER ctf
 
 CMD ["python", "/opt/ctf_agent/agent.py"]

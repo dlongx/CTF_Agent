@@ -5,7 +5,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{.title}}</title>
-  <link rel="stylesheet" href="/static/app.css?v=card-layout-20260503b">
+  <link rel="stylesheet" href="/static/app.css?v=20260714-layout">
 </head>
 <body>
   <main class="shell detail-shell" data-task-id="{{.taskID}}" data-not-found="{{.notFound}}">
@@ -49,7 +49,7 @@
       <section class="log-view">
         <div class="section-head">
           <h2>日志输出</h2>
-        <div class="toolbar">
+          <div class="toolbar">
             <button id="load-logs">查看日志</button>
             <button class="secondary" id="follow-logs">实时跟随</button>
             <button class="secondary" id="clear-logs">清空显示</button>
@@ -71,7 +71,7 @@
       </section>
     </section>
   </main>
-  <script src="/static/app.js?v=card-layout-20260503b"></script>
+  <script type="module" src="/static/app.js?v=20260714-layout"></script>
 </body>
 </html>
 {{end}}

@@ -1,0 +1,97 @@
+name: Docker
+
+on:
+  pull_request:
+    paths:
+      - "docker/**"
+      - "runtime/opencode/**"
+      - "scripts/smoke-fake-provider.ps1"
+      - "docker-build-light.bat"
+      - ".github/workflows/docker.yml"
+  schedule:
+    - cron: "17 3 1 * *"
+  workflow_dispatch:
+    inputs:
+      build_all:
+        description: Build every category image
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.x"
+          cache: true
+      - name: Select affected category images
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          BUILD_ALL: ${{ inputs.build_all }}
+        run: |
+          all_categories="web pwn crypto reverse forensics misc"
+          if [[ "$EVENT_NAME" == "schedule" || ( "$EVENT_NAME" == "workflow_dispatch" && "$BUILD_ALL" == "true" ) ]]; then
+            categories="$all_categories"
+          elif [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            categories="misc"
+          else
+            files="$(git diff --name-only "$BASE_SHA" HEAD)"
+            if printf '%s\n' "$files" | grep -Eq '^(docker/(agent-base|opencode-agent)/|runtime/opencode/|\.github/workflows/docker\.yml$)'; then
+              categories="$all_categories"
+            else
+              categories=""
+              for category in web pwn crypto reverse forensics misc; do
+                if printf '%s\n' "$files" | grep -q "^docker/${category}-agent/"; then
+                  categories="$categories $category"
+                fi
+              done
+              if printf '%s\n' "$files" | grep -Eq '^(scripts/smoke-fake-provider\.ps1|docker-build-light\.bat)$'; then
+                categories="$categories misc"
+              fi
+              categories="$(xargs <<<"$categories")"
+              [[ -n "$categories" ]] || categories="misc"
+            fi
+          fi
+          echo "CTF_AGENT_CATEGORIES=$categories" >> "$GITHUB_ENV"
+          echo "Selected categories: $categories"
+      - name: Build shared images
+        run: |
+          docker build --pull --build-arg APT_MIRROR=https://deb.debian.org/debian --build-arg APT_SECURITY_MIRROR=https://deb.debian.org/debian-security -t ctf-agent-base:latest docker/agent-base
+          docker build --build-arg NPM_REGISTRY=https://registry.npmjs.org -t ctf-agent-opencode:latest docker/opencode-agent
+      - name: Verify shared images
+        run: |
+          test "$(docker run --rm ctf-agent-opencode:latest id -u)" = "1000"
+          docker run --rm ctf-agent-opencode:latest sh -lc 'opencode --version && python -c "import requests, pwn" && python -m pip check'
+      - name: Build affected category images
+        run: |
+          for category in $CTF_AGENT_CATEGORIES; do
+            docker build -t "ctf-agent-${category}:latest" "docker/${category}-agent"
+          done
+      - name: Verify affected category images
+        run: |
+          for category in $CTF_AGENT_CATEGORIES; do
+            image="ctf-agent-${category}:latest"
+            test "$(docker run --rm "$image" id -u)" = "1000"
+            case "$category" in
+              misc) docker run --rm "$image" sh -lc 'python -c "import PIL, numpy, cv2, scipy, pdfplumber, fitz" && command -v pdfinfo exiftool unar opencode >/dev/null && python -m pip check' ;;
+              web) docker run --rm "$image" sh -lc 'python -c "import requests, bs4, aiohttp, flask, mitmproxy" && command -v sqlmap wfuzz nikto gobuster >/dev/null && python -m pip check' ;;
+              pwn) docker run --rm "$image" sh -lc 'python -c "import pwn, capstone, unicorn, ropper" && command -v gdb checksec one_gadget seccomp-tools >/dev/null && python -m pip check' ;;
+              crypto) docker run --rm "$image" sh -lc 'python -c "import Crypto, sympy, z3, fpylll, gmpy2, hashpumpy" && command -v hashcat john >/dev/null && python -m pip check' ;;
+              reverse) docker run --rm "$image" sh -lc 'python -c "import angr, capstone, frida, androguard, lief, qiling" && command -v jadx apktool rabin2 r2 smali >/dev/null && python -m pip check' ;;
+              forensics) docker run --rm "$image" sh -lc 'python -c "import PIL, scapy, construct, matplotlib" && command -v tshark zsteg binwalk foremost >/dev/null && python -m pip check' ;;
+            esac
+          done
+      - name: Fake-provider task smoke
+        if: contains(env.CTF_AGENT_CATEGORIES, 'misc')
+        shell: pwsh
+        run: ./scripts/smoke-fake-provider.ps1

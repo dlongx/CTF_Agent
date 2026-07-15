@@ -30,7 +30,7 @@ body {
 
 .shell {
   width: min(1380px, calc(100% - 32px));
-  height: 100vh;
+  height: 100dvh;
   margin: 0 auto;
   padding: 18px 0;
   display: flex;
@@ -57,11 +57,16 @@ body {
   align-items: center;
   column-gap: 16px;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) max-content;
+  grid-template-columns: minmax(210px, 1fr) minmax(400px, 560px) max-content;
 }
 
 .topbar-title {
   min-width: 0;
+}
+
+.topbar-title h1,
+.topbar > div h1 {
+  overflow-wrap: anywhere;
 }
 
 .topbar-actions {
@@ -70,6 +75,7 @@ body {
   justify-content: flex-end;
   gap: 12px;
   flex-wrap: wrap;
+  min-width: 0;
 }
 
 .eyebrow,
@@ -92,18 +98,6 @@ h2 {
 
 h1 {
   font-size: 28px;
-}
-
-.title-row {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  flex-wrap: nowrap;
-  min-width: 0;
-}
-
-.title-row h1 {
-  flex: 0 0 auto;
 }
 
 h2 {
@@ -138,7 +132,8 @@ h2 {
 }
 
 .submit-panel {
-  overflow: hidden;
+  overflow: auto;
+  padding: 10px 12px;
 }
 
 .tasks-panel {
@@ -151,8 +146,8 @@ h2 {
 form {
   display: grid;
   grid-template-columns: 1fr;
-  gap: 8px;
-  margin-top: 10px;
+  gap: 6px;
+  margin-top: 8px;
 }
 
 .provider-panel {
@@ -171,18 +166,18 @@ form {
 
 .top-provider-panel {
   align-items: center;
-  display: flex;
-  flex: 0 1 560px;
+  display: grid;
+  grid-template-columns: minmax(250px, 320px) minmax(0, 1fr);
   gap: 10px;
   margin-top: 0;
-  max-width: min(560px, 52vw);
-  min-width: 280px;
+  max-width: none;
+  min-width: 0;
   padding: 7px 9px;
-  width: auto;
+  width: 100%;
 }
 
 .top-provider-panel .field {
-  min-width: 150px;
+  min-width: 0;
 }
 
 .top-provider-panel label {
@@ -190,8 +185,18 @@ form {
 }
 
 .top-provider-panel select {
-  min-width: 150px;
+  min-width: 0;
   padding: 6px 8px;
+}
+
+.provider-controls {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.provider-controls button {
+  white-space: nowrap;
 }
 
 .top-provider-panel .muted {
@@ -338,7 +343,7 @@ button.danger:hover,
 
 .filters {
   display: grid;
-  grid-template-columns: repeat(3, 128px);
+  grid-template-columns: repeat(3, minmax(0, 128px));
   justify-content: start;
   gap: 8px;
   margin-top: 10px;
@@ -585,7 +590,7 @@ button:disabled {
 }
 
 .docker-cards {
-  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
 }
 
 .docker-card,
@@ -743,21 +748,40 @@ dd {
   margin: 0;
 }
 
-@media (max-width: 760px) {
+@media (max-width: 1340px) {
+  .home-topbar {
+    align-items: start;
+    grid-template-columns: minmax(0, 1fr) auto;
+    row-gap: 10px;
+  }
+
+  .home-topbar .topbar-title {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  .home-topbar .topbar-actions {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  .home-topbar .top-provider-panel {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+}
+
+@media (max-width: 900px) {
   body {
     overflow: auto;
   }
 
-  .shell {
-    height: auto;
-    min-height: 100vh;
-    overflow: visible;
-  }
-
+  .shell,
   .detail-shell {
-    height: 100dvh;
-    min-height: 0;
-    overflow: hidden;
+    height: auto;
+    max-height: none;
+    min-height: 100dvh;
+    overflow: visible;
   }
 
   .workspace-grid,
@@ -766,20 +790,58 @@ dd {
     overflow: visible;
   }
 
-  .detail-grid {
-    grid-template-rows: minmax(150px, 34%) minmax(0, 1fr);
-    min-height: 0;
-    overflow: hidden;
-  }
-
-  .detail-shell .task-info,
-  .detail-shell .log-view {
-    overflow: hidden;
+  .submit-panel,
+  .tasks-panel {
+    max-height: none;
   }
 
   .tasks-panel,
-  .cards {
+  .cards,
+  .detail-shell .task-info,
+  .detail-shell .log-view,
+  .task-info dl {
     overflow: visible;
+  }
+
+  .detail-grid {
+    grid-template-rows: auto;
+  }
+
+  .description-box {
+    max-height: 320px;
+    min-height: 160px;
+  }
+
+  .log-view {
+    min-height: 680px;
+  }
+
+  .detail-shell .section-head {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .detail-shell .toolbar {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    width: 100%;
+  }
+
+  .detail-shell .toolbar button {
+    min-width: 0;
+    width: 100%;
+  }
+
+  .detail-shell .terminal {
+    flex: 1 1 auto;
+    max-height: 70vh;
+    min-height: 320px;
+  }
+}
+
+@media (max-width: 760px) {
+  .shell {
+    width: min(100% - 24px, 1380px);
   }
 
   .filters {
@@ -794,21 +856,37 @@ dd {
   }
 
   .home-topbar {
-    display: flex;
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .home-topbar .topbar-title,
+  .home-topbar .top-provider-panel,
+  .home-topbar .topbar-actions {
+    grid-column: 1;
+  }
+
+  .home-topbar .topbar-title {
+    grid-row: 1;
+  }
+
+  .home-topbar .top-provider-panel {
+    grid-row: 2;
+  }
+
+  .home-topbar .topbar-actions {
+    grid-row: 3;
+    justify-content: flex-start;
+    width: 100%;
   }
 
   h1 {
     font-size: 26px;
   }
 
-  .title-row {
-    align-items: flex-start;
-    flex-direction: column;
-  }
-
   .top-provider-panel {
     align-items: stretch;
-    flex-direction: column;
+    grid-template-columns: 1fr;
     max-width: 100%;
     min-width: 0;
     width: 100%;
@@ -832,6 +910,26 @@ dd {
 
   .terminal-message-actions button {
     width: 100%;
+  }
+
+  .docker-cards {
+    grid-template-columns: 1fr;
+  }
+
+  .topbar-actions .summary {
+    flex: 1 0 100%;
+    order: 3;
+  }
+}
+
+@media (max-width: 360px) {
+  .provider-controls,
+  .docker-card .card-actions {
+    grid-template-columns: 1fr;
+  }
+
+  dl {
+    grid-template-columns: 78px minmax(0, 1fr);
   }
 }
 

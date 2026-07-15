@@ -5,30 +5,31 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{.title}}</title>
-  <link rel="stylesheet" href="/static/app.css?v=card-layout-20260503b">
+  <link rel="stylesheet" href="/static/app.css?v=20260714-layout">
 </head>
 <body>
   <main class="shell">
     <header class="topbar home-topbar">
       <div class="topbar-title">
         <p class="eyebrow">AI CTF AGENT</p>
-        <div class="title-row">
-          <h1>自动化解题调度台</h1>
-          <div class="provider-panel top-provider-panel" id="provider-panel">
-            <div class="field">
-              <label for="provider-format">模型接口格式</label>
-              <select id="provider-format" autocomplete="off">
-                <option value="">加载中</option>
-              </select>
-            </div>
-            <p class="muted" id="provider-status" role="status" aria-live="polite">正在读取当前模型接口配置。</p>
+        <h1>自动化解题调度台</h1>
+      </div>
+      <div class="provider-panel top-provider-panel" id="provider-panel">
+        <div class="field">
+          <label for="provider-format">模型接口格式</label>
+          <div class="provider-controls">
+            <select id="provider-format" autocomplete="off">
+              <option value="">加载中</option>
+            </select>
+            <button type="button" class="secondary" id="provider-test">测试连接</button>
           </div>
         </div>
+        <p class="muted" id="provider-status" role="status" aria-live="polite">正在读取当前模型接口配置。</p>
       </div>
       <div class="topbar-actions">
         <a class="button-link secondary" href="/containers">Docker管理</a>
         <button class="secondary danger" id="clear-results">清理历史结果</button>
-        <div class="summary" id="summary">加载中</div>
+        <div class="summary" id="summary" role="status" aria-live="polite">加载中</div>
       </div>
     </header>
 
@@ -118,7 +119,7 @@
       </section>
     </div>
   </main>
-  <script src="/static/app.js?v=card-layout-20260503b"></script>
+  <script type="module" src="/static/app.js?v=20260714-layout"></script>
 </body>
 </html>
 {{end}}

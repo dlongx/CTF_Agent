@@ -23,6 +23,7 @@ func NewRouter(service *Service) *gin.Engine {
 	router.LoadHTMLGlob(filepath.Join(webDir, "templates", "*.html"))
 
 	router.GET("/health", healthHandler)
+	router.GET("/ready", service.readyHandler)
 	router.Use(authMiddleware(service.cfg.AccessToken))
 	router.GET("/", service.indexPage)
 	router.GET("/containers", service.containersPage)
@@ -31,6 +32,7 @@ func NewRouter(service *Service) *gin.Engine {
 	router.GET("/api/containers", service.listContainers)
 	router.GET("/api/settings/provider", service.providerSettings)
 	router.POST("/api/settings/provider", service.updateProviderSettings)
+	router.POST("/api/settings/provider/test", service.testProviderSettings)
 	router.POST("/api/maintenance/clear-results", service.clearResults)
 	router.GET("/api/tasks", service.listTasks)
 	router.POST("/api/tasks", service.createTask)
@@ -38,6 +40,7 @@ func NewRouter(service *Service) *gin.Engine {
 	router.OPTIONS("/api/events", optionsHandler)
 	router.OPTIONS("/api/containers", optionsHandler)
 	router.OPTIONS("/api/settings/provider", optionsHandler)
+	router.OPTIONS("/api/settings/provider/test", optionsHandler)
 	router.OPTIONS("/api/maintenance/clear-results", optionsHandler)
 	router.GET("/api/tasks/:id", service.taskDetail)
 	router.GET("/api/tasks/:id/logs", service.taskLogs)
@@ -101,6 +104,15 @@ func findWebDir() string {
 
 func healthHandler(c *gin.Context) {
 	c.JSON(200, gin.H{"status": "ok"})
+}
+
+func (s *Service) readyHandler(c *gin.Context) {
+	response := s.Readiness(c.Request.Context())
+	status := http.StatusOK
+	if !response.OK {
+		status = http.StatusServiceUnavailable
+	}
+	c.JSON(status, response)
 }
 
 func optionsHandler(c *gin.Context) {
@@ -170,6 +182,25 @@ func (s *Service) updateProviderSettings(c *gin.Context) {
 	c.JSON(200, settings)
 }
 
+func (s *Service) testProviderSettings(c *gin.Context) {
+	var payload struct {
+		Format string `json:"format"`
+	}
+	if err := c.ShouldBindJSON(&payload); err != nil || strings.TrimSpace(payload.Format) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "invalid provider test payload"})
+		return
+	}
+	response := s.TestProvider(c.Request.Context(), payload.Format)
+	status := http.StatusOK
+	if !response.OK {
+		status = http.StatusBadGateway
+		if response.ErrorCode == "unsupported_provider" || response.ErrorCode == "provider_not_configured" {
+			status = http.StatusBadRequest
+		}
+	}
+	c.JSON(status, response)
+}
+
 func (s *Service) clearResults(c *gin.Context) {
 	tasksUpdated, filesRemoved, err := s.store.ClearResultData()
 	if err != nil {
@@ -198,11 +229,23 @@ func (s *Service) createTask(c *gin.Context) {
 		c.JSON(status, gin.H{"detail": detail})
 		return
 	}
+	defer c.Request.MultipartForm.RemoveAll()
 	name := strings.TrimSpace(c.Request.FormValue("name"))
 	category := strings.TrimSpace(c.Request.FormValue("type"))
 	description := strings.TrimSpace(c.Request.FormValue("description"))
 	if name == "" || category == "" || description == "" {
 		c.JSON(400, gin.H{"detail": "name, type and description are required"})
+		return
+	}
+	if len(name) > 200 || len(description) > 20_000 || len(c.Request.FormValue("target_ip")) > 512 {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "task fields exceed configured limits"})
+		return
+	}
+	category = normalizeCategory(category)
+	if _, ok := map[string]struct{}{
+		"misc": {}, "web": {}, "pwn": {}, "crypto": {}, "reverse": {}, "forensics": {},
+	}[category]; !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "unsupported challenge type"})
 		return
 	}
 	if _, err := s.activeOpenCodeProvider(); err != nil {
@@ -218,6 +261,7 @@ func (s *Service) createTask(c *gin.Context) {
 	files := c.Request.MultipartForm.File["attachments"]
 	count, err := saveUploadedFiles(files, attachmentsDir)
 	if err != nil {
+		_ = os.RemoveAll(filepath.Join(s.cfg.ChallengeDir, taskID))
 		if errors.Is(err, errUploadTooLarge) {
 			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"detail": err.Error()})
 			return
@@ -237,6 +281,7 @@ func (s *Service) createTask(c *gin.Context) {
 		CreatedAt:       time.Now().UTC(),
 	}
 	if err := s.Submit(task); err != nil {
+		_ = os.RemoveAll(filepath.Join(s.cfg.ChallengeDir, taskID))
 		if errors.Is(err, errTaskQueueFull) {
 			c.JSON(http.StatusTooManyRequests, gin.H{"detail": err.Error()})
 			return
@@ -318,6 +363,10 @@ func (s *Service) handleTaskMessage(c *gin.Context, message string) bool {
 		}
 		if errors.Is(err, errTaskMessageBusy) {
 			c.JSON(http.StatusConflict, gin.H{"detail": err.Error()})
+			return false
+		}
+		if errors.Is(err, errTaskQueueFull) {
+			c.JSON(http.StatusTooManyRequests, gin.H{"detail": err.Error()})
 			return false
 		}
 		c.JSON(400, gin.H{"detail": err.Error()})

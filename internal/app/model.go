@@ -16,6 +16,7 @@ const (
 )
 
 type Task struct {
+	SchemaVersion   int        `json:"schema_version"`
 	ID              string     `json:"id"`
 	Name            string     `json:"name"`
 	Category        string     `json:"category"`
@@ -75,6 +76,7 @@ type containerResponse struct {
 	ContainerState    string     `json:"container_state"`
 	Image             string     `json:"image"`
 	DockerStatus      string     `json:"docker_status"`
+	DiskUsage         string     `json:"disk_usage"`
 	DockerFound       bool       `json:"docker_found"`
 	DockerRunning     bool       `json:"docker_running"`
 	LastStep          string     `json:"last_step"`
@@ -97,6 +99,8 @@ type containerListResponse struct {
 	DockerError     string              `json:"docker_error,omitempty"`
 	LiveCount       int                 `json:"live_count"`
 	TrackedCount    int                 `json:"tracked_count"`
+	LastCleanupAt   *time.Time          `json:"last_cleanup_at,omitempty"`
+	CleanupRemoved  int                 `json:"cleanup_removed"`
 }
 
 type providerSettingsResponse struct {

@@ -1,0 +1,6 @@
+capstone==5.0.9
+keystone-engine==0.9.2
+LibcSearcher==1.1.5
+ropper==1.13.13
+ROPGadget==7.7
+unicorn==2.1.2

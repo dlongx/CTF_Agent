@@ -1,6 +1,20 @@
+import { fetchJSON } from './api.js';
+import {
+  containerStateText,
+  escapeHTML,
+  fmtDuration,
+  fmtTime,
+  statusBadge,
+  taskStatusText,
+  text,
+} from './ui.js';
+
+const appState = {
+  tasks: [],
+  containers: [],
+};
+
 const $ = (selector) => document.querySelector(selector);
-let allTasks = [];
-let allContainers = [];
 let cardRefreshTimeout;
 let detailRefreshTimeout;
 let containerRefreshTimeout;
@@ -12,33 +26,6 @@ const activeRefreshIntervalMs = 1500;
 const logTailBytes = 240000;
 const logWindowChars = 240000;
 const logTailNotice = `[日志较长，当前只显示最近约${Math.round(logTailBytes / 1024)}KB。完整内容仍保存在logs.txt和API中。]\n\n`;
-
-function statusBadge(status, id = '') {
-  const idAttr = id ? ` id="${escapeHTML(id)}"` : '';
-  return `<span${idAttr} class="badge ${escapeHTML(status || '')}">${escapeHTML(taskStatusText(status))}</span>`;
-}
-
-function fmtTime(value) {
-  if (!value) return '-';
-  return new Date(value).toLocaleString();
-}
-
-function fmtDuration(startValue, endValue) {
-  if (!startValue) return '-';
-  const start = new Date(startValue).getTime();
-  const end = endValue ? new Date(endValue).getTime() : Date.now();
-  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return '-';
-  const totalSeconds = Math.floor((end - start) / 1000);
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  if (hours > 0) return `${hours}小时${minutes}分钟`;
-  if (minutes > 0) return `${minutes}分钟`;
-  return `${Math.max(totalSeconds, 0)}秒`;
-}
-
-function text(value, fallback = '-') {
-  return value === undefined || value === null || value === '' ? fallback : String(value);
-}
 
 function renderLogWindow(logs, maybeTruncated = false) {
   let value = logs || '';
@@ -55,27 +42,18 @@ function appendLogWindow(logBox, chunk) {
   logBox.scrollTop = logBox.scrollHeight;
 }
 
-async function fetchJSON(url, options) {
-  const response = await fetch(url, options);
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    throw new Error(data.detail || `HTTP ${response.status}`);
-  }
-  return data;
-}
-
 async function loadCards() {
   const cards = $('#task-cards');
   if (!cards) return;
   const summary = $('#summary');
   const payload = await fetchJSON('/api/tasks');
-  allTasks = payload.tasks || [];
-  const counts = allTasks.reduce((acc, task) => {
+  appState.tasks = payload.tasks || [];
+  const counts = appState.tasks.reduce((acc, task) => {
     acc[task.status] = (acc[task.status] || 0) + 1;
     return acc;
   }, {});
   const activeCount = (counts.running || 0) + (counts.queued || 0);
-  summary.textContent = `总计${allTasks.length}个任务 · 运行中${activeCount} · 已解出${counts.solved || 0} · 失败${counts.failed || 0}`;
+  summary.textContent = `总计${appState.tasks.length}个任务 · 运行中${activeCount} · 已解出${counts.solved || 0} · 失败${counts.failed || 0}`;
   renderCards();
 }
 
@@ -168,6 +146,27 @@ function renderCards() {
   });
 }
 
+async function testProviderConnection() {
+  const select = $('#provider-format');
+  const status = $('#provider-status');
+  const button = $('#provider-test');
+  if (!select || !status || !button || !select.value) return;
+  button.disabled = true;
+  status.textContent = '正在测试Provider连接，最长等待20秒。';
+  try {
+    const result = await fetchJSON('/api/settings/provider/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ format: select.value }),
+    });
+    status.textContent = `Provider连接正常，耗时${result.latency_ms}ms。`;
+  } catch (error) {
+    status.textContent = `Provider连接失败：${error.message}`;
+  } finally {
+    button.disabled = false;
+  }
+}
+
 function cardPrimaryAction(task) {
   if (task.status === 'solved' && task.flag) {
     return `<button class="secondary copy-flag-card" type="button" data-task-id="${escapeHTML(task.id)}">复制flag</button>`;
@@ -178,7 +177,7 @@ function cardPrimaryAction(task) {
 async function copyFlagFromCard(event) {
   const button = event.currentTarget;
   const taskID = button.dataset.taskId;
-  const task = allTasks.find((item) => item.id === taskID);
+  const task = appState.tasks.find((item) => item.id === taskID);
   if (!task?.flag) return;
   const originalText = button.textContent;
   button.disabled = true;
@@ -219,15 +218,20 @@ async function loadContainers() {
   if (!cards) return;
   const summary = $('#docker-summary');
   const payload = await fetchJSON('/api/containers');
-  allContainers = payload.containers || [];
-  const counts = allContainers.reduce((acc, item) => {
+  appState.containers = payload.containers || [];
+  const counts = appState.containers.reduce((acc, item) => {
     acc[item.container_state] = (acc[item.container_state] || 0) + 1;
     return acc;
   }, {});
   const dockerStatus = payload.docker_available
     ? `未销毁容器${payload.live_count || 0}个`
-    : `Docker不可用：${payload.docker_error || 'unknown'}`;
-  summary.textContent = `${dockerStatus} · 正在解题${counts.running || 0} · 已停止${(counts.retained || 0) + (counts.exited || 0)}项`;
+    : 'Docker不可用';
+  const cleanupStatus = payload.last_cleanup_at
+    ? `最近清理${payload.cleanup_removed || 0}个`
+    : '尚未执行保留清理';
+  summary.textContent = `${dockerStatus} · 正在解题${counts.running || 0} · 已停止${(counts.retained || 0) + (counts.exited || 0)}项 · ${cleanupStatus}`;
+  summary.title = payload.docker_available ? '' : (payload.docker_error || 'Docker服务当前不可访问');
+  summary.classList.toggle('inline-error', !payload.docker_available);
   if (dockerCardsPointerInside) {
     pendingContainerRender = true;
     return;
@@ -238,11 +242,11 @@ async function loadContainers() {
 function renderContainers() {
   const cards = $('#docker-cards');
   if (!cards) return;
-  if (allContainers.length === 0) {
+  if (appState.containers.length === 0) {
     cards.innerHTML = '<p class="muted">当前没有未销毁的ctf-agent任务容器。</p>';
     return;
   }
-  cards.innerHTML = allContainers.map((item) => {
+  cards.innerHTML = appState.containers.map((item) => {
     const stateText = containerStateText(item.container_state);
     const canClose = item.docker_found;
     return `
@@ -259,6 +263,7 @@ function renderContainers() {
             <span>任务:${escapeHTML(taskStatusText(item.task_status))}</span>
             <span>容器:${stateText}</span>
             <span>时长:${escapeHTML(fmtDuration(item.started_at, item.finished_at))}</span>
+            <span>磁盘:${escapeHTML(item.disk_usage || '-')}</span>
           </div>
         </a>
         <div class="card-actions">
@@ -273,29 +278,12 @@ function renderContainers() {
   });
 }
 
-function containerStateText(state) {
-  if (state === 'running') return '正在解题';
-  if (state === 'retained') return '已停止未销毁';
-  if (state === 'exited') return '已停止未销毁';
-  if (state === 'missing') return 'Docker未找到';
-  return state || '-';
-}
-
-function taskStatusText(status) {
-  if (status === 'queued') return '排队中';
-  if (status === 'running') return '运行中';
-  if (status === 'completed') return '本轮结束';
-  if (status === 'solved') return '已解出';
-  if (status === 'failed') return '运行失败';
-  return status || '-';
-}
-
 function filteredTasks() {
   const type = $('#filter-type')?.value || '';
   const status = $('#filter-status')?.value || '';
   const date = $('#filter-date')?.value || '';
   const now = new Date();
-  return allTasks.filter((task) => {
+  return appState.tasks.filter((task) => {
     if (type && task.category !== type) return false;
     if (status === 'active' && !['running', 'queued'].includes(task.status)) return false;
     if (['running', 'queued', 'completed', 'solved', 'failed'].includes(status) && task.status !== status) return false;
@@ -475,16 +463,6 @@ async function followLogs() {
   socket.onclose = () => {
     socket = undefined;
   };
-}
-
-function escapeHTML(value) {
-  return String(value).replace(/[&<>"']/g, (char) => ({
-    '&': '&amp;',
-    '<': '&lt;',
-    '>': '&gt;',
-    '"': '&quot;',
-    "'": '&#39;',
-  }[char]));
 }
 
 async function closeContainerFromCard(event) {
@@ -689,7 +667,7 @@ function setupDockerCardStability() {
 
 function setupActivePolling() {
   window.setInterval(() => {
-    if ($('#task-cards') && allTasks.some((task) => task.status === 'running' || task.status === 'queued')) {
+    if ($('#task-cards') && appState.tasks.some((task) => task.status === 'running' || task.status === 'queued')) {
       loadCards().catch(() => {});
     }
     if ($('#docker-cards')) {
@@ -723,6 +701,7 @@ document.addEventListener('DOMContentLoaded', () => {
   loadFiltersFromURL();
   $('#task-form')?.addEventListener('submit', submitTask);
   $('#provider-format')?.addEventListener('change', updateProviderSettings);
+  $('#provider-test')?.addEventListener('click', testProviderConnection);
   $('#refresh')?.addEventListener('click', loadCards);
   $('#clear-results')?.addEventListener('click', clearHistoricalResults);
   $('#docker-refresh')?.addEventListener('click', loadContainers);

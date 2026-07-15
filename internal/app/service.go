@@ -6,10 +6,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -34,18 +35,23 @@ type dockerTaskRunnerContext func(context.Context, Config, *Task, LogSink, func(
 type dockerHintRunnerContext func(context.Context, Config, *Task, string, LogSink) (DockerResult, error)
 
 type Service struct {
-	cfg   Config
-	store *Store
-	hub   *Hub
-	queue chan string
-	done  chan struct{}
-	wg    sync.WaitGroup
-	once  sync.Once
-	runMu sync.Mutex
-	runs  map[string]context.CancelFunc
+	cfg            Config
+	store          *Store
+	hub            *Hub
+	queue          chan string
+	done           chan struct{}
+	wg             sync.WaitGroup
+	once           sync.Once
+	runMu          sync.Mutex
+	runs           map[string]context.CancelFunc
+	busy           map[string]bool
+	queuedMessages map[string]string
 
 	providerMu           sync.RWMutex
 	activeProviderFormat string
+	maintenanceMu        sync.RWMutex
+	lastCleanupAt        *time.Time
+	lastCleanupRemoved   int
 
 	runDockerTask dockerTaskRunnerContext
 	runDockerHint dockerHintRunnerContext
@@ -56,17 +62,19 @@ func NewService(cfg Config) (*Service, error) {
 	if err := os.MkdirAll(cfg.ChallengeDir, 0o755); err != nil {
 		return nil, err
 	}
-	store, err := NewStore(cfg.ChallengeDir)
+	store, err := NewStoreWithOptions(cfg.ChallengeDir, cfg.LogMaxBytes, defaultLogMaxBackups)
 	if err != nil {
 		return nil, err
 	}
 	service := &Service{
-		cfg:   cfg,
-		store: store,
-		hub:   NewHub(),
-		queue: make(chan string, max(1, cfg.MaxContainers)*4),
-		done:  make(chan struct{}),
-		runs:  map[string]context.CancelFunc{},
+		cfg:            cfg,
+		store:          store,
+		hub:            NewHub(),
+		queue:          make(chan string, max(1, cfg.MaxContainers)*4),
+		done:           make(chan struct{}),
+		runs:           map[string]context.CancelFunc{},
+		busy:           map[string]bool{},
+		queuedMessages: map[string]string{},
 
 		runDockerTask: RunDockerTask,
 		runDockerHint: RunDockerHint,
@@ -77,9 +85,11 @@ func NewService(cfg Config) (*Service, error) {
 		service.wg.Add(1)
 		go service.worker(i)
 	}
+	service.wg.Add(1)
+	go service.retentionCleaner()
 	for _, id := range store.RecoverableIDs() {
 		if err := store.MarkRecovered(id); err != nil {
-			log.Printf("recover task %s: %v", id, err)
+			slog.Error("recover queued task", "task_id", id, "error", err)
 			continue
 		}
 		service.AppendLog(id, "[dispatcher] recovered queued task after service startup\n")
@@ -90,15 +100,31 @@ func NewService(cfg Config) (*Service, error) {
 
 func (s *Service) Close() {
 	s.once.Do(func() {
+		s.cancelAllRuns()
 		close(s.done)
-		s.wg.Wait()
+		waited := make(chan struct{})
+		go func() {
+			s.wg.Wait()
+			close(waited)
+		}()
+		select {
+		case <-waited:
+			return
+		case <-time.After(10 * time.Second):
+			slog.Warn("service shutdown exceeded grace period; forcing managed container cleanup", "grace", "10s")
+		}
+		for _, task := range s.store.List() {
+			if task.Status == StatusRunning && task.ContainerName != "" {
+				_ = CloseTaskContainer(task.ContainerName)
+			}
+		}
 	})
 }
 
 func (s *Service) NewTaskID() string {
 	var buf [16]byte
 	if _, err := rand.Read(buf[:]); err != nil {
-		return strconvItoa(int(time.Now().UnixNano()))
+		return strconv.Itoa(int(time.Now().UnixNano()))
 	}
 	return hex.EncodeToString(buf[:])
 }
@@ -119,7 +145,7 @@ func (s *Service) Submit(task *Task) error {
 		s.publishTaskChanged(task.ID)
 		return errTaskQueueFull
 	}
-	s.AppendLog(task.ID, "[dispatcher] queued workers="+strconvItoa(max(1, s.cfg.MaxContainers))+"\n")
+	s.AppendLog(task.ID, "[dispatcher] queued workers="+strconv.Itoa(max(1, s.cfg.MaxContainers))+"\n")
 	return nil
 }
 
@@ -223,7 +249,7 @@ func (s *Service) saveProviderFormat(format string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.providerStatePath(), data, 0o644)
+	return atomicWriteFile(s.providerStatePath(), data, 0o644)
 }
 
 func (s *Service) providerStatePath() string {
@@ -246,6 +272,10 @@ func (s *Service) ListManagedContainers() containerListResponse {
 		response.DockerError = err.Error()
 	}
 	response.TrackedCount = len(response.Containers)
+	s.maintenanceMu.RLock()
+	response.LastCleanupAt = s.lastCleanupAt
+	response.CleanupRemoved = s.lastCleanupRemoved
+	s.maintenanceMu.RUnlock()
 	return response
 }
 
@@ -286,6 +316,7 @@ func buildManagedContainerResponses(tasks []*Task, dockerContainers map[string]D
 			ContainerState:    containerState,
 			Image:             image,
 			DockerStatus:      dockerInfo.Status,
+			DiskUsage:         dockerInfo.Size,
 			DockerFound:       dockerFound,
 			DockerRunning:     dockerInfo.Running,
 			LastStep:          task.LastStep,
@@ -320,12 +351,12 @@ func managedContainerState(task *Task, dockerInfo DockerContainer, dockerFound b
 
 func (s *Service) AppendLog(taskID string, text string) {
 	if err := s.store.AppendLog(taskID, text); err != nil {
-		log.Printf("append log %s: %v", taskID, err)
+		slog.Error("append task log", "task_id", taskID, "error", err)
 		return
 	}
 	if sessionID := extractOpenCodeSessionID(text); sessionID != "" {
 		if err := s.store.MarkOpenCodeSession(taskID, sessionID); err != nil {
-			log.Printf("mark opencode session %s: %v", taskID, err)
+			slog.Error("mark opencode session", "task_id", taskID, "error", err)
 		} else {
 			s.publishTaskChanged(taskID)
 		}
@@ -376,6 +407,16 @@ func (s *Service) worker(index int) {
 		case <-s.done:
 			return
 		case id := <-s.queue:
+			select {
+			case <-s.done:
+				return
+			default:
+			}
+			if message, ok := s.takeQueuedMessage(id); ok {
+				s.runContinuation(index, id, message)
+				s.releaseTaskSlot(id)
+				continue
+			}
 			s.runTask(index, id)
 		}
 	}
@@ -394,7 +435,7 @@ func (s *Service) runTask(workerIndex int, taskID string) {
 		return
 	}
 	s.publishTaskChanged(taskID)
-	s.AppendLog(taskID, "[dispatcher] worker="+strconvItoa(workerIndex)+" picked task="+taskID+"\n")
+	s.AppendLog(taskID, "[dispatcher] worker="+strconv.Itoa(workerIndex)+" picked task="+taskID+"\n")
 
 	ctx, cancel := s.taskRunContext(taskID)
 	defer cancel()
@@ -414,10 +455,6 @@ func (s *Service) runTask(workerIndex int, taskID string) {
 	if !s.finishRun(ctx, taskID, result, err, "task") {
 		return
 	}
-}
-
-func (s *Service) ContinueTask(taskID string, hint string) error {
-	return s.SendTaskMessage(taskID, hint)
 }
 
 func (s *Service) SendTaskMessage(taskID string, message string) error {
@@ -441,27 +478,70 @@ func (s *Service) SendTaskMessage(taskID string, message string) error {
 	if _, err := s.activeOpenCodeProvider(); err != nil {
 		return err
 	}
+	if !s.reserveTaskMessage(taskID, message) {
+		return errTaskMessageBusy
+	}
+	if !s.enqueue(taskID) {
+		s.releaseTaskSlot(taskID)
+		return errTaskQueueFull
+	}
+	s.AppendLog(taskID, "[dispatcher] continuation queued\n")
+	return nil
+}
+
+func (s *Service) runContinuation(workerIndex int, taskID string, message string) {
+	current, ok := s.store.Get(taskID)
+	if !ok || current.Status == StatusQueued || current.Status == StatusRunning ||
+		!current.ContainerKept || current.ContainerName == "" || strings.TrimSpace(current.OpenCodeSession) == "" {
+		return
+	}
 	if err := s.store.MarkRunning(taskID); err != nil {
-		return err
+		s.AppendLog(taskID, "[dispatcher] failed to mark continuation running: "+err.Error()+"\n")
+		return
 	}
 	s.publishTaskChanged(taskID)
+	s.AppendLog(taskID, "[dispatcher] worker="+strconv.Itoa(workerIndex)+" picked continuation\n")
 	s.AppendLog(taskID, "\n[dispatcher] user message: "+message+"\n")
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		current, ok := s.store.Get(taskID)
-		if !ok {
-			return
-		}
-		ctx, cancel := s.taskRunContext(taskID)
-		defer cancel()
-		defer s.clearTaskCancel(taskID, cancel)
-		result, err := s.continueDockerRun(ctx, current, message)
-		if !s.finishRun(ctx, taskID, result, err, "continuation") {
-			return
-		}
-	}()
-	return nil
+
+	ctx, cancel := s.taskRunContext(taskID)
+	defer cancel()
+	defer s.clearTaskCancel(taskID, cancel)
+	result, err := s.continueDockerRun(ctx, current, message)
+	s.finishRun(ctx, taskID, result, err, "continuation")
+}
+
+func (s *Service) reserveTaskMessage(taskID string, message string) bool {
+	s.runMu.Lock()
+	defer s.runMu.Unlock()
+	if s.busy == nil {
+		s.busy = map[string]bool{}
+	}
+	if s.queuedMessages == nil {
+		s.queuedMessages = map[string]string{}
+	}
+	if s.busy[taskID] {
+		return false
+	}
+	s.busy[taskID] = true
+	s.queuedMessages[taskID] = message
+	return true
+}
+
+func (s *Service) takeQueuedMessage(taskID string) (string, bool) {
+	s.runMu.Lock()
+	defer s.runMu.Unlock()
+	message, ok := s.queuedMessages[taskID]
+	if ok {
+		delete(s.queuedMessages, taskID)
+	}
+	return message, ok
+}
+
+func (s *Service) releaseTaskSlot(taskID string) {
+	s.runMu.Lock()
+	delete(s.busy, taskID)
+	delete(s.queuedMessages, taskID)
+	s.runMu.Unlock()
 }
 
 func (s *Service) initialDockerRun(ctx context.Context, task *Task, containerSink func(string)) (DockerResult, error) {
@@ -553,7 +633,7 @@ func (s *Service) runUntilSolved(ctx context.Context, taskID string, result Dock
 	if result.Solved || result.ExitCode != 0 {
 		return result, nil
 	}
-	for round := 1; ; round++ {
+	for round := 1; round <= s.cfg.AutoContinueRounds; round++ {
 		if ctx.Err() != nil {
 			return result, ctx.Err()
 		}
@@ -572,7 +652,7 @@ func (s *Service) runUntilSolved(ctx context.Context, taskID string, result Dock
 			return result, errContinueUnavailable
 		}
 		message := autoContinuePrompt(round)
-		s.AppendLog(taskID, "[dispatcher] auto-continue round="+strconvItoa(round)+" until solved\n")
+		s.AppendLog(taskID, "[dispatcher] auto-continue round="+strconv.Itoa(round)+" until solved\n")
 		next, err := s.continueDockerRun(ctx, current, message)
 		if err != nil {
 			return next, err
@@ -582,6 +662,10 @@ func (s *Service) runUntilSolved(ctx context.Context, taskID string, result Dock
 			return result, nil
 		}
 	}
+	if s.cfg.AutoContinueRounds > 0 {
+		s.AppendLog(taskID, "[dispatcher] auto-continue limit reached rounds="+strconv.Itoa(s.cfg.AutoContinueRounds)+"\n")
+	}
+	return result, nil
 }
 
 func (s *Service) enrichRunnerResult(ctx context.Context, taskID string, result DockerResult) DockerResult {
@@ -617,7 +701,7 @@ func (s *Service) enrichRunnerResult(ctx context.Context, taskID string, result 
 
 func autoContinuePrompt(round int) string {
 	return "继续解这道CTF题。上一轮没有按协议输出“这道题目已经解出”。" +
-		"请基于已有文件、脚本和发现继续验证，不要重复无关枚举。第" + strconvItoa(round) +
+		"请基于已有文件、脚本和发现继续验证，不要重复无关枚举。第" + strconv.Itoa(round) +
 		"次自动续跑。只有确认Flag后，才按两行协议输出：第一行“这道题目已经解出”，第二行输出完整Flag。"
 }
 
@@ -670,6 +754,11 @@ func (s *Service) taskRunContext(taskID string) (context.Context, context.Cancel
 	}
 	s.runs[taskID] = combinedCancel
 	s.runMu.Unlock()
+	select {
+	case <-s.done:
+		combinedCancel()
+	default:
+	}
 	return ctx, combinedCancel
 }
 
@@ -688,12 +777,25 @@ func (s *Service) cancelTask(taskID string) {
 	}
 }
 
+func (s *Service) cancelAllRuns() {
+	s.runMu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(s.runs))
+	for _, cancel := range s.runs {
+		cancels = append(cancels, cancel)
+	}
+	s.runMu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+}
+
 func (s *Service) CloseTaskContainer(taskID string) error {
 	task, ok := s.store.Get(taskID)
 	if !ok {
 		return os.ErrNotExist
 	}
 	s.cancelTask(taskID)
+	s.releaseTaskSlot(taskID)
 	if task.Status == StatusQueued {
 		if err := s.store.MarkStopped(taskID, taskStoppedMessage); err != nil {
 			return err
@@ -722,11 +824,81 @@ func (s *Service) recoverInterruptedRunningContainers() {
 			continue
 		}
 		if err := s.store.MarkInterruptedContainerRetained(task.ID); err != nil {
-			log.Printf("retain interrupted container %s: %v", task.ID, err)
+			slog.Error("retain interrupted container", "task_id", task.ID, "container", task.ContainerName, "error", err)
 			continue
 		}
 		s.AppendLog(task.ID, "[dispatcher] service restarted; existing container retained for manual inspection\n")
 	}
+}
+
+func (s *Service) retentionCleaner() {
+	defer s.wg.Done()
+	s.cleanupExpiredContainers()
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-ticker.C:
+			s.cleanupExpiredContainers()
+		}
+	}
+}
+
+func (s *Service) cleanupExpiredContainers() {
+	if s.cfg.ContainerRetention <= 0 {
+		return
+	}
+	containers, err := ListDockerContainers()
+	if err != nil {
+		return
+	}
+	now := time.Now().UTC()
+	removed := 0
+	tracked := map[string]*Task{}
+	for _, task := range s.store.List() {
+		if task.ContainerName == "" {
+			continue
+		}
+		tracked[task.ContainerName] = task
+		_, exists := containers[task.ContainerName]
+		if task.ContainerKept && !exists {
+			_ = s.store.MarkContainerClosed(task.ID)
+			continue
+		}
+		if task.Status == StatusRunning || !task.ContainerKept || !exists {
+			continue
+		}
+		retainedAt := task.CreatedAt
+		if task.FinishedAt != nil {
+			retainedAt = *task.FinishedAt
+		}
+		if now.Sub(retainedAt) < s.cfg.ContainerRetention {
+			continue
+		}
+		if err := CloseTaskContainer(task.ContainerName); err == nil {
+			removed++
+			_ = s.store.MarkContainerClosed(task.ID)
+			s.AppendLog(task.ID, "[maintenance] expired retained container removed\n")
+			s.publishTaskChanged(task.ID)
+		}
+	}
+	for name := range containers {
+		if _, ok := tracked[name]; ok {
+			continue
+		}
+		createdAt, err := DockerContainerCreatedAt(name)
+		if err == nil && now.Sub(createdAt) >= s.cfg.ContainerRetention {
+			if CloseTaskContainer(name) == nil {
+				removed++
+			}
+		}
+	}
+	s.maintenanceMu.Lock()
+	s.lastCleanupAt = &now
+	s.lastCleanupRemoved = removed
+	s.maintenanceMu.Unlock()
 }
 
 func summarizeLastStep(logs string) string {
@@ -745,11 +917,4 @@ func summarizeLastStep(logs string) string {
 		return line
 	}
 	return "暂无可用步骤"
-}
-
-func max(a int, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }

@@ -1,0 +1,15 @@
+chardet==7.4.3
+aiohttp==3.13.5
+flask-unsign==1.2.1
+itsdangerous==2.2.0
+Jinja2==3.1.6
+pycurl==7.46.0
+pyparsing==3.3.2
+mitmproxy==12.2.2
+PyJWT==2.12.1
+python-jose==3.5.0
+requests-toolbelt==1.0.0
+six==1.17.0
+sqlmap==1.10.3
+websocket-client==1.9.0
+websockets==16.0
