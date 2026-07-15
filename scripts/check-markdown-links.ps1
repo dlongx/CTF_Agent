@@ -8,6 +8,7 @@ $rootPath = [IO.Path]::GetFullPath($Root)
 $broken = [Collections.Generic.List[string]]::new()
 $checked = 0
 $pattern = [regex]'(?<!!)\[[^\]]*\]\((?<target>[^)]+)\)'
+$fencePattern = [regex]'^(?: {0,3})(?<marker>`{3,}|~{3,})'
 
 Get-ChildItem -LiteralPath $rootPath -Recurse -File -Filter '*.md' |
     Where-Object {
@@ -17,27 +18,47 @@ Get-ChildItem -LiteralPath $rootPath -Recurse -File -Filter '*.md' |
     ForEach-Object {
         $document = $_
         $content = [IO.File]::ReadAllText($document.FullName)
-        foreach ($match in $pattern.Matches($content)) {
-            $target = $match.Groups['target'].Value.Trim()
-            if ($target.StartsWith('<') -and $target.EndsWith('>')) {
-                $target = $target.Substring(1, $target.Length - 2)
-            }
-            if ($target -match '^(?:https?://|mailto:|#)' -or $target -eq '') {
+        $fenceCharacter = $null
+        $fenceLength = 0
+        foreach ($line in ($content -split '\r?\n')) {
+            $fenceMatch = $fencePattern.Match($line)
+            if ($fenceMatch.Success) {
+                $marker = $fenceMatch.Groups['marker'].Value
+                if ($null -eq $fenceCharacter) {
+                    $fenceCharacter = $marker[0]
+                    $fenceLength = $marker.Length
+                } elseif ($marker[0] -eq $fenceCharacter -and $marker.Length -ge $fenceLength) {
+                    $fenceCharacter = $null
+                    $fenceLength = 0
+                }
                 continue
             }
-            if ($target -match '[''"\[\]$\r\n]' -or $target -match '\s') {
+            if ($null -ne $fenceCharacter -or $line -match '^(?: {4}|\t)') {
                 continue
             }
-            $pathPart = ($target -split '#', 2)[0]
-            if ($pathPart -eq '') {
-                continue
-            }
-            $pathPart = [Uri]::UnescapeDataString($pathPart)
-            $candidate = [IO.Path]::GetFullPath((Join-Path $document.DirectoryName $pathPart))
-            $checked++
-            if (-not (Test-Path -LiteralPath $candidate)) {
-                $relativeDocument = [IO.Path]::GetRelativePath($rootPath, $document.FullName)
-                $broken.Add("${relativeDocument}: $target")
+            $scanLine = [regex]::Replace($line, '`+[^`]*`+', '')
+            foreach ($match in $pattern.Matches($scanLine)) {
+                $target = $match.Groups['target'].Value.Trim()
+                if ($target.StartsWith('<') -and $target.EndsWith('>')) {
+                    $target = $target.Substring(1, $target.Length - 2)
+                }
+                if ($target -match '^(?:https?://|mailto:|#)' -or $target -eq '') {
+                    continue
+                }
+                if ($target -match '[''"\[\]$\r\n]' -or $target -match '\s') {
+                    continue
+                }
+                $pathPart = ($target -split '#', 2)[0]
+                if ($pathPart -eq '') {
+                    continue
+                }
+                $pathPart = [Uri]::UnescapeDataString($pathPart)
+                $candidate = [IO.Path]::GetFullPath((Join-Path $document.DirectoryName $pathPart))
+                $checked++
+                if (-not (Test-Path -LiteralPath $candidate)) {
+                    $relativeDocument = [IO.Path]::GetRelativePath($rootPath, $document.FullName)
+                    $broken.Add("${relativeDocument}: $target")
+                }
             }
         }
     }

@@ -15,6 +15,7 @@
 
 - 最低Go版本升级到1.25，Gin升级到1.12.0。
 - `quic-go`升级到0.59.1，修复可达漏洞GO-2026-5676。
+- CI漏洞扫描固定使用Go1.26.5；Python基础镜像在工具链完成兼容验证前保持3.12系列更新。
 - 默认任务总超时45分钟，单轮20分钟，无输出5分钟。
 - 自动续跑受6轮上限和全局Worker并发约束，到达上限后进入`completed`。
 - Docker镜像固定基础镜像Digest、OpenCode和直接依赖版本，并以非root用户运行。
@@ -28,6 +29,7 @@
 
 ### Fixed
 
+- 修复Windows全新检出后CRLF导致`gofmt`失败，以及Linux把代码块内容误判为Markdown链接的问题。
 - 修复reverse镜像的Z3、Pillow和Unicorn依赖冲突，以及web镜像的Wfuzz无效元数据。
 - 修复登录shell丢失CTF工具PATH和移动端Provider面板被固定高度撑开的问题。
 - Windows并行文件测试使用有界重试清理临时目录，避免安全扫描导致的瞬时失败。
