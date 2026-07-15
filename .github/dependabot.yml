@@ -18,6 +18,9 @@ updates:
     directory: /docker/agent-base
     schedule:
       interval: monthly
+    ignore:
+      - dependency-name: python
+        versions: [">= 3.13"]
   - package-ecosystem: docker
     directory: /docker/opencode-agent
     schedule:
