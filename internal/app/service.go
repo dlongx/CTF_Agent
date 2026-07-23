@@ -20,6 +20,11 @@ var openCodeSessionPattern = regexp.MustCompile(`Observation:\s+OpenCode session
 var errTaskQueueFull = errors.New("任务队列已满，请稍后再提交")
 var errContinueUnavailable = errors.New("OpenCode未解出且当前容器或session不可继续")
 
+const (
+	bridgeRunTimeoutExitCode  = 124
+	bridgeIdleTimeoutExitCode = 125
+)
+
 type taskEvent struct {
 	Type   string `json:"type"`
 	TaskID string `json:"task_id,omitempty"`
@@ -718,15 +723,28 @@ func (s *Service) markRunnerResult(taskID string, result DockerResult, label str
 		_ = CloseTaskContainer(result.ContainerName)
 		return nil
 	}
-	message := "OpenCode本轮执行失败"
-	if label == "continuation" {
-		message = "OpenCode继续执行失败"
-	}
+	message := runnerFailureMessage(result, label, s.cfg)
 	if result.ExitCode == 0 {
 		message = "OpenCode尚未解出，等待继续"
 		return s.store.MarkCompleted(taskID, result.ExitCode, message, result.ContainerName, result.Retained)
 	}
 	return s.store.MarkFinishedWithFailureMessage(taskID, result.ExitCode, nil, message, result.ContainerName, result.Retained, message)
+}
+
+func runnerFailureMessage(result DockerResult, label string, cfg Config) string {
+	if result.OOMKilled {
+		return "OpenCode因容器内存不足被系统终止（当前上限" + cfg.MemLimit + "），请提高CTF_AGENT_MEM_LIMIT并重启服务后重新提交任务"
+	}
+	switch result.ExitCode {
+	case bridgeRunTimeoutExitCode:
+		return "OpenCode单轮执行超过" + cfg.OpenCodeRunTimeout.String() + "上限，容器已保留，可发送消息继续同一session"
+	case bridgeIdleTimeoutExitCode:
+		return "OpenCode连续" + cfg.OpenCodeIdleTimeout.String() + "无输出，已停止本轮；容器已保留，可发送消息继续同一session"
+	}
+	if label == "continuation" {
+		return "OpenCode继续执行失败"
+	}
+	return "OpenCode本轮执行失败"
 }
 
 func (s *Service) taskWasStopped(taskID string) bool {

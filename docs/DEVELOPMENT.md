@@ -24,15 +24,20 @@ Copy-Item opencode.env.example opencode.env
 运行限制变量:
 
 ```text
-CTF_AGENT_TASK_TIMEOUT=45m
-CTF_AGENT_OPENCODE_RUN_TIMEOUT=20m
-CTF_AGENT_OPENCODE_IDLE_TIMEOUT=5m
+CTF_AGENT_TASK_TIMEOUT=0s
+CTF_AGENT_OPENCODE_RUN_TIMEOUT=0s
+CTF_AGENT_OPENCODE_IDLE_TIMEOUT=0s
 CTF_AGENT_AUTO_CONTINUE_ROUNDS=6
 CTF_AGENT_CONTAINER_RETENTION=24h
 CTF_AGENT_LOG_MAX_BYTES=10485760
+CTF_AGENT_MAX_CONTAINERS=1
+CTF_AGENT_MEM_LIMIT=auto
+CTF_AGENT_CPUS=auto
 ```
 
 所有时长使用Go duration格式。`AUTO_CONTINUE_ROUNDS=0`明确关闭自动续跑。完整默认值以`internal/app/config.go`为唯一代码来源。
+任务、单轮和空闲超时均可设为`0s`关闭。资源值为`auto`时，任务独占除1个CPU和至少1GiB内存之外的Docker可用资源。
+`CTF_AGENT_CONTAINER_RETENTION=0s`关闭保留容器和孤儿容器的定时清理，适合共享Docker守护进程的隔离烟测。
 
 ## 本地开发
 

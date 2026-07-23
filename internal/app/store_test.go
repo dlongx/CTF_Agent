@@ -828,6 +828,28 @@ func TestRunTaskStopsAutoContinueOnHardFailure(t *testing.T) {
 	}
 }
 
+func TestRunnerFailureMessageReportsOOM(t *testing.T) {
+	t.Parallel()
+
+	cfg := Config{MemLimit: "768m", OpenCodeRunTimeout: 40 * time.Minute, OpenCodeIdleTimeout: 15 * time.Minute}
+	message := runnerFailureMessage(DockerResult{OOMKilled: true}, "task", cfg)
+	if !strings.Contains(message, "容器内存不足") || !strings.Contains(message, "768m") ||
+		!strings.Contains(message, "CTF_AGENT_MEM_LIMIT") || !strings.Contains(message, "重新提交") {
+		t.Fatalf("OOM failure message=%q", message)
+	}
+	if got := runnerFailureMessage(DockerResult{}, "continuation", cfg); got != "OpenCode继续执行失败" {
+		t.Fatalf("continuation failure message=%q", got)
+	}
+	runTimeout := runnerFailureMessage(DockerResult{ExitCode: bridgeRunTimeoutExitCode}, "task", cfg)
+	if !strings.Contains(runTimeout, "40m0s") || !strings.Contains(runTimeout, "继续同一session") {
+		t.Fatalf("run timeout message=%q", runTimeout)
+	}
+	idleTimeout := runnerFailureMessage(DockerResult{ExitCode: bridgeIdleTimeoutExitCode}, "task", cfg)
+	if !strings.Contains(idleTimeout, "15m0s") || !strings.Contains(idleTimeout, "无输出") {
+		t.Fatalf("idle timeout message=%q", idleTimeout)
+	}
+}
+
 func TestRunTaskAutoContinueCanBeStoppedByUser(t *testing.T) {
 	t.Parallel()
 

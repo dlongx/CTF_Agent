@@ -57,15 +57,15 @@ docker build -t ctf-agent-misc:latest docker/misc-agent
 |`CTF_AGENT_ACCESS_TOKEN`|空|非回环监听时必填|
 |`CTF_AGENT_ALLOWED_ORIGINS`|空|明确允许的跨域来源|
 |`CTF_AGENT_DATA_DIR`|`data`|本地数据根目录|
-|`CTF_AGENT_MAX_CONTAINERS`|`4`|Worker和运行容器上限|
-|`CTF_AGENT_TASK_TIMEOUT`|`45m`|任务总超时|
-|`CTF_AGENT_OPENCODE_RUN_TIMEOUT`|`20m`|单次OpenCode运行超时|
-|`CTF_AGENT_OPENCODE_IDLE_TIMEOUT`|`5m`|OpenCode无输出超时|
+|`CTF_AGENT_MAX_CONTAINERS`|`1`|Worker和运行容器上限；默认单任务独占|
+|`CTF_AGENT_TASK_TIMEOUT`|`0s`|任务总超时；`0s`表示不限时|
+|`CTF_AGENT_OPENCODE_RUN_TIMEOUT`|`0s`|单次OpenCode运行超时；`0s`表示不限时|
+|`CTF_AGENT_OPENCODE_IDLE_TIMEOUT`|`0s`|OpenCode无输出超时；`0s`表示不限时|
 |`CTF_AGENT_AUTO_CONTINUE_ROUNDS`|`6`|自动续跑轮数，`0`表示不续跑|
-|`CTF_AGENT_CONTAINER_RETENTION`|`24h`|未解出容器保留时间|
+|`CTF_AGENT_CONTAINER_RETENTION`|`24h`|未解出容器保留时间；`0s`表示关闭自动清理|
 |`CTF_AGENT_LOG_MAX_BYTES`|`10485760`|单份任务日志上限，保留3份归档|
-|`CTF_AGENT_MEM_LIMIT`|`512m`|单容器内存限制|
-|`CTF_AGENT_CPUS`|`1.0`|单容器CPU限制|
+|`CTF_AGENT_MEM_LIMIT`|`auto`|自动使用Docker可用内存减去10%且至少保留1GiB|
+|`CTF_AGENT_CPUS`|`auto`|自动使用Docker可用CPU并保留1核|
 |`CTF_AGENT_PIDS_LIMIT`|`1024`|单容器进程数限制|
 |`CTF_AGENT_DISABLE_NETWORK`|`false`|关闭任务容器网络|
 

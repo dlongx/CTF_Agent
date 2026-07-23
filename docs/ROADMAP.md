@@ -2,16 +2,20 @@
 
 本文件是任务状态的唯一来源。状态使用`done`、`in_progress`、`blocked`、`planned`。证据必须是可重复命令、测试名称、工作流或文档路径；提交列在尚未提交时写`working-tree`。
 
-最后更新时间:2026-07-15
+最后更新时间:2026-07-20
 
 |ID|状态|完成证据|关联提交|最后更新|
 |---|---|---|---|---|
 |P0-01|done|Go1.25.12/1.26.5测试、vet和构建通过；`govulncheck`可达漏洞0项|working-tree|2026-07-13|
 |P0-02|done|`TestRunTaskStopsAtAutoContinueLimit`、并发继续与队列测试|working-tree|2026-07-13|
-|P0-03|done|默认45m/20m/5m；`TestRunTaskMarksTimeout`；服务关闭取消与10秒上限|working-tree|2026-07-13|
+|P0-03|done|默认`0s/0s/0s`不限时；`TestLoadConfigUsesSingleTaskUnlimitedDefaults`、`test_read_config_defaults_to_unlimited_timeouts`及显式超时分类测试|working-tree|2026-07-20|
 |P0-04|done|`test_bridge.py`配置、Prompt文件和脱敏测试；假Provider真实容器烟测|working-tree|2026-07-13|
 |P0-05|done|`/health`、`/ready`、`/api/settings/provider/test`及诊断测试|working-tree|2026-07-13|
 |P0-06|done|`smoke-opencode.bat`使用真实截止时间、可靠休眠、预检和失败清理|working-tree|2026-07-13|
+|P0-07|done|真实失败任务cgroup记录`oom_kill=1`；`TestDockerOOMHelpers`、`TestRunnerFailureMessageReportsOOM`；reverse镜像使用`unar`成功解出RAR5附件|working-tree|2026-07-20|
+|P0-08|done|假Provider烟测设置`CTF_AGENT_CONTAINER_RETENTION=0s`；`TestContainerRetentionAcceptsZero`；全量检查与烟测通过|working-tree|2026-07-20|
+|P0-09|done|真实超时任务遗留进程复现；`test_process_tree_helpers_and_timeout_exit_codes`；Docker `--init`及单轮/空闲超时分类测试|working-tree|2026-07-20|
+|P0-10|done|`TestAutoDockerResourceLimits`；Go配置、`start-dev.bat`及示例环境均默认单任务独占；真实容器提升至6720MiB/15CPU|working-tree|2026-07-20|
 |P1-01|done|`.github/workflows/ci.yml`与`docker.yml`；Go1.26.5安全扫描；Windows全新检出保持Go文件LF|working-tree|2026-07-15|
 |P1-02|done|README、AGENTS、MIT、架构、开发、运维、API、数据模型、ADR和来源清单|working-tree|2026-07-13|
 |P1-03|done|schema1、原子写入、`.bak`恢复、10MiB×4日志、备份恢复脚本及Store测试|working-tree|2026-07-13|

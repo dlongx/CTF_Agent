@@ -105,6 +105,53 @@ func TestFilenameAndSummaryHelpers(t *testing.T) {
 	}
 }
 
+func TestDockerOOMHelpers(t *testing.T) {
+	t.Parallel()
+
+	count, ok := parseDockerOOMKillCount("low 0\noom 3\noom_kill 2\n")
+	if !ok || count != 2 {
+		t.Fatalf("parseDockerOOMKillCount=(%d,%v)", count, ok)
+	}
+	if _, ok := parseDockerOOMKillCount("oom 3\n"); ok {
+		t.Fatal("missing oom_kill entry was accepted")
+	}
+	if !dockerOOMOccurred(
+		dockerOOMSnapshot{killCount: 1, hasCount: true},
+		dockerOOMSnapshot{killCount: 2, hasCount: true},
+	) {
+		t.Fatal("increased cgroup oom_kill count was not detected")
+	}
+	if dockerOOMOccurred(
+		dockerOOMSnapshot{killCount: 2, hasCount: true},
+		dockerOOMSnapshot{killCount: 2, hasCount: true},
+	) {
+		t.Fatal("unchanged cgroup oom_kill count was treated as a new OOM")
+	}
+	if !dockerOOMOccurred(
+		dockerOOMSnapshot{hasState: true},
+		dockerOOMSnapshot{killed: true, hasState: true},
+	) {
+		t.Fatal("Docker OOM state transition was not detected")
+	}
+}
+
+func TestAutoDockerResourceLimits(t *testing.T) {
+	t.Parallel()
+
+	limits := autoDockerResourceLimits(16, 8<<30)
+	if limits.memory != "7168m" || limits.cpus != "15" {
+		t.Fatalf("auto limits=%+v", limits)
+	}
+	minimum := autoDockerResourceLimits(1, 1<<30)
+	if minimum.memory != "512m" || minimum.cpus != "1" {
+		t.Fatalf("minimum auto limits=%+v", minimum)
+	}
+	explicit := resolveDockerResourceLimits("2g", "3.5")
+	if explicit.memory != "2g" || explicit.cpus != "3.5" {
+		t.Fatalf("explicit limits=%+v", explicit)
+	}
+}
+
 func TestReadinessHelpers(t *testing.T) {
 	t.Parallel()
 	root := tempDirWithRemoveRetry(t)
@@ -289,6 +336,7 @@ if "%1"=="exec" (
   exit /b 0
 )
 if "%1"=="run" exit /b 0
+if "%1"=="update" exit /b 0
 if "%1"=="rm" exit /b 0
 if "%1"=="version" exit /b 0
 if "%1"=="image" exit /b 0
@@ -308,7 +356,7 @@ case "$1" in
       *" cat /workspace/"*) printf '%s' "$FAKE_DOCKER_CAT" ;;
       *) printf '%s' "$FAKE_DOCKER_EXEC" ;;
     esac ;;
-  run|rm|version|image) exit 0 ;;
+  run|rm|update|version|image) exit 0 ;;
   *) exit 2 ;;
 esac
 `

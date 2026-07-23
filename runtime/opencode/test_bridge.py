@@ -42,7 +42,45 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(bridge.parse_duration_seconds("20m0s", 1), 1200)
         self.assertEqual(bridge.parse_duration_seconds("1h5m30s", 1), 3930)
         self.assertEqual(bridge.parse_duration_seconds("invalid", 42), 42)
-        self.assertEqual(bridge.parse_duration_seconds("0s", 42), 42)
+        self.assertEqual(bridge.parse_duration_seconds("0s", 42), 0)
+
+    def test_describe_process_exit_distinguishes_signals(self) -> None:
+        self.assertEqual(bridge.describe_process_exit(3), "opencode run exited with status 3")
+        signal_exit = bridge.describe_process_exit(-9)
+        self.assertIn("terminated by signal", signal_exit)
+        self.assertIn("9", signal_exit)
+
+    def test_process_tree_helpers_and_timeout_exit_codes(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            proc_root = Path(raw_root)
+            process_stats = {
+                10: "10 (opencode parent) S 1 0 0 0",
+                11: "11 (tool child) S 10 0 0 0",
+                12: "12 (detached worker) S 11 0 0 0",
+                13: "13 (unrelated) S 1 0 0 0",
+            }
+            for pid, stat in process_stats.items():
+                process_dir = proc_root / str(pid)
+                process_dir.mkdir()
+                (process_dir / "stat").write_text(stat, encoding="utf-8")
+            self.assertEqual(bridge.descendant_process_ids(10, proc_root), {11, 12})
+            self.assertTrue(bridge.process_is_active(11, proc_root))
+            (proc_root / "11" / "stat").write_text(
+                "11 (tool child) Z 10 0 0 0", encoding="utf-8"
+            )
+            self.assertFalse(bridge.process_is_active(11, proc_root))
+
+        config = make_config(Path("."))
+        for error, exit_code in (
+            (bridge.OpenCodeRunTimeoutError("run timeout"), 124),
+            (bridge.OpenCodeIdleTimeoutError("idle timeout"), 125),
+        ):
+            with self.subTest(exit_code=exit_code), mock.patch.object(
+                bridge, "read_config", return_value=config
+            ), mock.patch.object(bridge, "configure_opencode"), mock.patch.object(
+                bridge, "run_opencode_terminal", side_effect=error
+            ), mock.patch.object(bridge, "log"):
+                self.assertEqual(bridge.run_bridge(), exit_code)
 
     def test_configure_opencode_keeps_key_out_of_files_and_inline_json(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
@@ -141,6 +179,22 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(bridge.parse_skill_ids("PWN,pwn, crypto"), ("pwn", "crypto"))
         for category in ("web", "pwn", "crypto", "reverse", "forensics", "misc", "unknown"):
             self.assertTrue(bridge.category_guidance(category))
+
+    def test_read_config_defaults_to_unlimited_timeouts(self) -> None:
+        required = {
+            "CHALLENGE_NAME": "name",
+            "CHALLENGE_TYPE": "misc",
+            "CHALLENGE_DESC": "description",
+            "OPENCODE_PROVIDER_ID": "ctf",
+            "OPENCODE_PROVIDER_NPM": "npm",
+            "OPENCODE_BASE_URL": "https://example.test/v1",
+            "OPENCODE_API_KEY": "key",
+            "OPENCODE_MODEL": "model",
+        }
+        with mock.patch.dict(os.environ, required, clear=True):
+            config = bridge.read_config()
+        self.assertEqual(config.run_timeout_seconds, 0)
+        self.assertEqual(config.idle_timeout_seconds, 0)
 
     def test_configure_opencode_rejects_incomplete_credentials(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
@@ -254,7 +308,31 @@ class BridgeTests(unittest.TestCase):
             with mock.patch.object(bridge, "WORKSPACE_DIR", workspace), mock.patch.object(
                 bridge.subprocess, "Popen", side_effect=fake_popen
             ), mock.patch.object(bridge, "log"):
-                with self.assertRaisesRegex(RuntimeError, "idle timeout"):
+                with self.assertRaisesRegex(bridge.OpenCodeIdleTimeoutError, "idle timeout"):
+                    bridge.run_opencode_once(config, "secret prompt", "")
+            self.assertFalse((config.exec_dir / "ctf-agent-prompt.md").exists())
+
+    def test_run_opencode_once_enforces_run_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            workspace = root / "workspace"
+            config = make_config(
+                root,
+                exec_dir=workspace / ".tmp",
+                run_timeout_seconds=0.05,
+                idle_timeout_seconds=5,
+            )
+            original_popen = subprocess.Popen
+
+            def fake_popen(_args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+                return original_popen(
+                    [sys.executable, "-c", "import time; time.sleep(10)"], **kwargs
+                )
+
+            with mock.patch.object(bridge, "WORKSPACE_DIR", workspace), mock.patch.object(
+                bridge.subprocess, "Popen", side_effect=fake_popen
+            ), mock.patch.object(bridge, "log"):
+                with self.assertRaisesRegex(bridge.OpenCodeRunTimeoutError, "configured timeout"):
                     bridge.run_opencode_once(config, "secret prompt", "")
             self.assertFalse((config.exec_dir / "ctf-agent-prompt.md").exists())
 

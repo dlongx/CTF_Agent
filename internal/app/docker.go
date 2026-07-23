@@ -18,16 +18,34 @@ import (
 
 const dockerHostInternal = "host.docker.internal"
 
+const (
+	defaultAutoMemoryLimit = "4g"
+	defaultAutoCPUs        = "2"
+)
+
 type LogSink func(string)
 
 type DockerResult struct {
 	ExitCode        int
 	ContainerName   string
 	Retained        bool
+	OOMKilled       bool
 	Solved          bool
 	Flag            string
 	WriteupFileName string
 	WriteupContent  string
+}
+
+type dockerOOMSnapshot struct {
+	killCount uint64
+	hasCount  bool
+	killed    bool
+	hasState  bool
+}
+
+type dockerResourceLimits struct {
+	memory string
+	cpus   string
 }
 
 type DockerContainer struct {
@@ -108,11 +126,14 @@ func RunDockerTask(ctx context.Context, cfg Config, task *Task, logSink LogSink,
 
 	containerName := "ctf-agent-" + task.ID
 	_ = exec.Command("docker", "rm", "-f", containerName).Run()
+	limits := resolveDockerResourceLimits(cfg.MemLimit, cfg.CPUs)
 	args := []string{
 		"run", "-d",
+		"--init",
 		"--name", containerName,
-		"--memory", cfg.MemLimit,
-		"--cpus", cfg.CPUs,
+		"--memory", limits.memory,
+		"--memory-swap", limits.memory,
+		"--cpus", limits.cpus,
 		"--pids-limit", cfg.PidsLimit,
 		"--cap-drop", "ALL",
 		"--security-opt", "no-new-privileges:true",
@@ -141,7 +162,7 @@ func RunDockerTask(ctx context.Context, cfg Config, task *Task, logSink LogSink,
 	args = append(args, cfg.ImageForCategory(task.Category), "tail", "-f", "/dev/null")
 
 	logSink("[runner] starting container image=" + cfg.ImageForCategory(task.Category) +
-		" mem_limit=" + cfg.MemLimit + " cpus=" + cfg.CPUs + "\n")
+		" mem_limit=" + limits.memory + " cpus=" + limits.cpus + "\n")
 	if output, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput(); err != nil {
 		return DockerResult{ExitCode: 2, ContainerName: containerName}, errors.New(string(output))
 	}
@@ -149,7 +170,7 @@ func RunDockerTask(ctx context.Context, cfg Config, task *Task, logSink LogSink,
 	if containerSink != nil {
 		containerSink(containerName)
 	}
-	result, err := runAgentInContainer(ctx, containerName, openCodeProviderEnv(cfg), logSink)
+	result, err := runAgentWithDiagnostics(ctx, containerName, openCodeProviderEnv(cfg), limits.memory, logSink)
 	result.ContainerName = containerName
 	if ctx.Err() != nil {
 		_ = CloseTaskContainer(containerName)
@@ -175,11 +196,16 @@ func RunDockerHint(ctx context.Context, cfg Config, task *Task, hint string, log
 		return DockerResult{ExitCode: 2}, errors.New("refusing unmanaged container name")
 	}
 	logSink("[runner] continuing retained container_name=" + task.ContainerName + "\n")
+	limits := resolveDockerResourceLimits(cfg.MemLimit, cfg.CPUs)
+	if err := updateDockerResourceLimits(task.ContainerName, limits); err != nil {
+		return DockerResult{ExitCode: 2, ContainerName: task.ContainerName, Retained: true}, err
+	}
+	logSink("[runner] retained container resources mem_limit=" + limits.memory + " cpus=" + limits.cpus + "\n")
 	env := append(openCodeProviderEnv(cfg), "CTF_AGENT_USER_HINT="+hint)
 	if task.OpenCodeSession != "" {
 		env = append(env, "OPENCODE_SESSION_ID="+task.OpenCodeSession)
 	}
-	result, err := runAgentInContainer(ctx, task.ContainerName, env, logSink)
+	result, err := runAgentWithDiagnostics(ctx, task.ContainerName, env, limits.memory, logSink)
 	if ctx.Err() != nil {
 		_ = CloseTaskContainer(task.ContainerName)
 		return result, ctx.Err()
@@ -249,6 +275,75 @@ func openCodeProviderEnv(cfg Config) []string {
 		"CTF_AGENT_OPENCODE_RUN_TIMEOUT=" + cfg.OpenCodeRunTimeout.String(),
 		"CTF_AGENT_OPENCODE_IDLE_TIMEOUT=" + cfg.OpenCodeIdleTimeout.String(),
 	}
+}
+
+func resolveDockerResourceLimits(memory string, cpus string) dockerResourceLimits {
+	memory = strings.TrimSpace(memory)
+	cpus = strings.TrimSpace(cpus)
+	if !strings.EqualFold(memory, "auto") && !strings.EqualFold(cpus, "auto") {
+		return dockerResourceLimits{memory: memory, cpus: cpus}
+	}
+	auto := dockerResourceLimits{memory: defaultAutoMemoryLimit, cpus: defaultAutoCPUs}
+	output, err := exec.Command("docker", "info", "--format", "{{.NCPU}}\t{{.MemTotal}}").CombinedOutput()
+	if err == nil {
+		fields := strings.Fields(string(output))
+		if len(fields) == 2 {
+			ncpu, cpuErr := strconv.Atoi(fields[0])
+			memTotal, memErr := strconv.ParseInt(fields[1], 10, 64)
+			if cpuErr == nil && memErr == nil {
+				auto = autoDockerResourceLimits(ncpu, memTotal)
+			}
+		}
+	}
+	if !strings.EqualFold(memory, "auto") {
+		auto.memory = memory
+	}
+	if !strings.EqualFold(cpus, "auto") {
+		auto.cpus = cpus
+	}
+	return auto
+}
+
+func autoDockerResourceLimits(ncpu int, memoryBytes int64) dockerResourceLimits {
+	const (
+		mib            = int64(1 << 20)
+		minimumReserve = int64(1 << 30)
+	)
+	reserve := memoryBytes / 10
+	if reserve < minimumReserve {
+		reserve = minimumReserve
+	}
+	usableMiB := (memoryBytes - reserve) / mib
+	if usableMiB < 512 {
+		usableMiB = 512
+	}
+	usableMiB = usableMiB / 64 * 64
+	usableCPUs := ncpu - 1
+	if usableCPUs < 1 {
+		usableCPUs = 1
+	}
+	return dockerResourceLimits{
+		memory: strconv.FormatInt(usableMiB, 10) + "m",
+		cpus:   strconv.Itoa(usableCPUs),
+	}
+}
+
+func updateDockerResourceLimits(containerName string, limits dockerResourceLimits) error {
+	output, err := exec.Command(
+		"docker", "update",
+		"--memory", limits.memory,
+		"--memory-swap", limits.memory,
+		"--cpus", limits.cpus,
+		containerName,
+	).CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	message := strings.TrimSpace(string(output))
+	if message == "" {
+		message = err.Error()
+	}
+	return errors.New(message)
 }
 
 func dockerReachableBaseURL(raw string) string {
@@ -330,6 +425,59 @@ func runAgentInContainer(ctx context.Context, containerName string, env []string
 	}
 	logSink("[runner] agent exited with status=0\n")
 	return DockerResult{ExitCode: 0, ContainerName: containerName}, nil
+}
+
+func runAgentWithDiagnostics(ctx context.Context, containerName string, env []string, memLimit string, logSink LogSink) (DockerResult, error) {
+	before := readDockerOOMSnapshot(containerName)
+	result, err := runAgentInContainer(ctx, containerName, env, logSink)
+	if result.ExitCode == 0 || ctx.Err() != nil {
+		return result, err
+	}
+	after := readDockerOOMSnapshot(containerName)
+	if dockerOOMOccurred(before, after) {
+		result.OOMKilled = true
+		logSink("[runner] container memory limit exceeded; OpenCode process was OOM-killed mem_limit=" + memLimit + "\n")
+	}
+	return result, err
+}
+
+func readDockerOOMSnapshot(containerName string) dockerOOMSnapshot {
+	var snapshot dockerOOMSnapshot
+	output, err := exec.Command(
+		"docker", "exec", containerName, "sh", "-c",
+		`cat /sys/fs/cgroup/memory.events 2>/dev/null`,
+	).CombinedOutput()
+	if err == nil {
+		snapshot.killCount, snapshot.hasCount = parseDockerOOMKillCount(string(output))
+	}
+	if snapshot.hasCount {
+		return snapshot
+	}
+	output, err = exec.Command("docker", "inspect", "--format", "{{.State.OOMKilled}}", containerName).CombinedOutput()
+	if err == nil {
+		snapshot.killed, err = strconv.ParseBool(strings.TrimSpace(string(output)))
+		snapshot.hasState = err == nil
+	}
+	return snapshot
+}
+
+func parseDockerOOMKillCount(output string) (uint64, bool) {
+	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 || fields[0] != "oom_kill" {
+			continue
+		}
+		count, err := strconv.ParseUint(fields[1], 10, 64)
+		return count, err == nil
+	}
+	return 0, false
+}
+
+func dockerOOMOccurred(before dockerOOMSnapshot, after dockerOOMSnapshot) bool {
+	if before.hasCount && after.hasCount {
+		return after.killCount > before.killCount
+	}
+	return before.hasState && after.hasState && !before.killed && after.killed
 }
 
 func streamPipe(wg *sync.WaitGroup, reader io.Reader, logSink LogSink) {
