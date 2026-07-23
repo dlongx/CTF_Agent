@@ -22,7 +22,7 @@ if exist "%ROOT%\opencode.env" (
 )
 
 if not defined CTF_AGENT_DOCKER_IMAGE set "CTF_AGENT_DOCKER_IMAGE=ctf-agent-opencode:latest"
-if not defined CTF_AGENT_MAX_CONTAINERS set "CTF_AGENT_MAX_CONTAINERS=4"
+if not defined CTF_AGENT_MAX_CONTAINERS set "CTF_AGENT_MAX_CONTAINERS=1"
 if not defined CTF_AGENT_PIDS_LIMIT set "CTF_AGENT_PIDS_LIMIT=1024"
 if not defined CTF_AGENT_SKILLS_DIR set "CTF_AGENT_SKILLS_DIR=runtime\opencode\skills"
 if not defined OPENCODE_PROVIDER_FORMAT set "OPENCODE_PROVIDER_FORMAT=openai-compatible"

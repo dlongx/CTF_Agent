@@ -39,11 +39,13 @@ try {
         CTF_AGENT_DOCKER_IMAGE = $DockerImage
         CTF_AGENT_IMAGE_MISC = $DockerImage
         CTF_AGENT_MAX_CONTAINERS = '1'
-        CTF_AGENT_TASK_TIMEOUT = '5m'
+        CTF_AGENT_TASK_TIMEOUT = '0s'
         CTF_AGENT_AUTO_CONTINUE_ROUNDS = '1'
-        CTF_AGENT_OPENCODE_RUN_TIMEOUT = '3m'
-        CTF_AGENT_OPENCODE_IDLE_TIMEOUT = '1m'
-        CTF_AGENT_CONTAINER_RETENTION = '1h'
+        CTF_AGENT_OPENCODE_RUN_TIMEOUT = '0s'
+        CTF_AGENT_OPENCODE_IDLE_TIMEOUT = '0s'
+        # The smoke service shares the Docker daemon but owns only its temporary data store.
+        # Disable orphan cleanup so it cannot remove retained containers from the real service.
+        CTF_AGENT_CONTAINER_RETENTION = '0s'
         CTF_AGENT_AGENT_SCRIPT = Join-Path $root 'runtime/opencode/bridge.py'
         CTF_AGENT_SKILLS_DIR = Join-Path $root 'runtime/opencode/skills'
         OPENCODE_PROVIDER_FORMAT = 'openai-compatible'

@@ -16,7 +16,10 @@ func TestNormalizeCategory(t *testing.T) {
 	}
 }
 
-func TestLoadConfigUsesBoundedRuntimeDefaults(t *testing.T) {
+func TestLoadConfigUsesSingleTaskUnlimitedDefaults(t *testing.T) {
+	t.Setenv("CTF_AGENT_MEM_LIMIT", "")
+	t.Setenv("CTF_AGENT_CPUS", "")
+	t.Setenv("CTF_AGENT_MAX_CONTAINERS", "")
 	t.Setenv("CTF_AGENT_TASK_TIMEOUT", "")
 	t.Setenv("CTF_AGENT_AUTO_CONTINUE_ROUNDS", "")
 	t.Setenv("CTF_AGENT_OPENCODE_RUN_TIMEOUT", "")
@@ -25,10 +28,13 @@ func TestLoadConfigUsesBoundedRuntimeDefaults(t *testing.T) {
 	t.Setenv("CTF_AGENT_LOG_MAX_BYTES", "")
 
 	cfg := LoadConfig()
-	if cfg.TaskTimeout != 45*time.Minute || cfg.AutoContinueRounds != 6 {
+	if cfg.MemLimit != "auto" || cfg.CPUs != "auto" || cfg.MaxContainers != 1 {
+		t.Fatalf("resource defaults memory=%q cpus=%q max=%d", cfg.MemLimit, cfg.CPUs, cfg.MaxContainers)
+	}
+	if cfg.TaskTimeout != 0 || cfg.AutoContinueRounds != 6 {
 		t.Fatalf("task defaults timeout=%s rounds=%d", cfg.TaskTimeout, cfg.AutoContinueRounds)
 	}
-	if cfg.OpenCodeRunTimeout != 20*time.Minute || cfg.OpenCodeIdleTimeout != 5*time.Minute {
+	if cfg.OpenCodeRunTimeout != 0 || cfg.OpenCodeIdleTimeout != 0 {
 		t.Fatalf("opencode defaults run=%s idle=%s", cfg.OpenCodeRunTimeout, cfg.OpenCodeIdleTimeout)
 	}
 	if cfg.ContainerRetention != 24*time.Hour || cfg.LogMaxBytes != 10<<20 {
@@ -40,6 +46,13 @@ func TestAutoContinueRoundsAcceptsZero(t *testing.T) {
 	t.Setenv("CTF_AGENT_AUTO_CONTINUE_ROUNDS", "0")
 	if got := LoadConfig().AutoContinueRounds; got != 0 {
 		t.Fatalf("AutoContinueRounds=%d want 0", got)
+	}
+}
+
+func TestContainerRetentionAcceptsZero(t *testing.T) {
+	t.Setenv("CTF_AGENT_CONTAINER_RETENTION", "0s")
+	if got := LoadConfig().ContainerRetention; got != 0 {
+		t.Fatalf("ContainerRetention=%s want 0", got)
 	}
 }
 

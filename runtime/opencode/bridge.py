@@ -22,6 +22,26 @@ from typing import Any
 WORKSPACE_DIR = Path("/workspace")
 DEFAULT_EXEC_DIR = WORKSPACE_DIR / ".tmp"
 SOLVED_MARKER = "这道题目已经解出"
+BRIDGE_RUN_TIMEOUT_EXIT_CODE = 124
+BRIDGE_IDLE_TIMEOUT_EXIT_CODE = 125
+
+
+class OpenCodeTimeoutError(RuntimeError):
+    """Base class for bounded OpenCode execution failures."""
+
+    exit_code = 1
+
+
+class OpenCodeRunTimeoutError(OpenCodeTimeoutError):
+    """The complete OpenCode round exceeded its configured deadline."""
+
+    exit_code = BRIDGE_RUN_TIMEOUT_EXIT_CODE
+
+
+class OpenCodeIdleTimeoutError(OpenCodeTimeoutError):
+    """OpenCode produced no output for the configured idle interval."""
+
+    exit_code = BRIDGE_IDLE_TIMEOUT_EXIT_CODE
 
 
 @dataclass(frozen=True)
@@ -73,10 +93,10 @@ def read_config() -> BridgeConfig:
         session_id=os.getenv("OPENCODE_SESSION_ID", "").strip(),
         exec_dir=Path(os.getenv("CTF_AGENT_EXEC_DIR", str(DEFAULT_EXEC_DIR))),
         run_timeout_seconds=parse_duration_seconds(
-            os.getenv("CTF_AGENT_OPENCODE_RUN_TIMEOUT", "20m"), 20 * 60
+            os.getenv("CTF_AGENT_OPENCODE_RUN_TIMEOUT", "0s"), 0
         ),
         idle_timeout_seconds=parse_duration_seconds(
-            os.getenv("CTF_AGENT_OPENCODE_IDLE_TIMEOUT", "5m"), 5 * 60
+            os.getenv("CTF_AGENT_OPENCODE_IDLE_TIMEOUT", "0s"), 0
         ),
     )
 
@@ -94,7 +114,7 @@ def parse_duration_seconds(raw: str, fallback: float) -> float:
             return fallback
         total += float(match.group(1)) * units[match.group(2)]
         position = match.end()
-    if position != len(value) or total <= 0:
+    if position != len(value) or total < 0:
         return fallback
     return total
 
@@ -513,30 +533,112 @@ def dedupe_preserve_order(values: list[str]) -> list[str]:
     return result
 
 
+def read_process_parent_map(proc_root: Path = Path("/proc")) -> dict[int, int]:
+    """Read Linux process parent relationships without command-line details."""
+    parents: dict[int, int] = {}
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return parents
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            raw = (entry / "stat").read_text(encoding="utf-8")
+            closing = raw.rfind(")")
+            fields = raw[closing + 1 :].split()
+            if closing < 0 or len(fields) < 2:
+                continue
+            parents[int(entry.name)] = int(fields[1])
+        except (OSError, ValueError):
+            continue
+    return parents
+
+
+def descendant_process_ids(root_pid: int, proc_root: Path = Path("/proc")) -> set[int]:
+    """Return every process whose ancestry reaches root_pid."""
+    parents = read_process_parent_map(proc_root)
+    descendants: set[int] = set()
+    frontier = {root_pid}
+    while frontier:
+        children = {pid for pid, parent in parents.items() if parent in frontier}
+        children -= descendants
+        if not children:
+            break
+        descendants.update(children)
+        frontier = children
+    return descendants
+
+
+def signal_processes(process_ids: set[int], signal_number: int) -> None:
+    """Best-effort signal a captured set of Linux process ids."""
+    for pid in sorted(process_ids, reverse=True):
+        try:
+            os.kill(pid, signal_number)
+        except (OSError, ProcessLookupError):
+            continue
+
+
+def process_is_active(pid: int, proc_root: Path = Path("/proc")) -> bool:
+    """Return false for missing, zombie, or dead Linux processes."""
+    try:
+        raw = (proc_root / str(pid) / "stat").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    closing = raw.rfind(")")
+    if closing < 0:
+        return False
+    fields = raw[closing + 1 :].split()
+    return bool(fields) and fields[0] not in {"Z", "X"}
+
+
 def terminate_process(process: subprocess.Popen[Any]) -> None:
-    """Terminate the complete OpenCode process group with a bounded grace period."""
+    """Terminate OpenCode and detached descendants with a bounded grace period."""
     if process.poll() is not None:
         return
-    try:
-        if os.name == "nt":
+    if os.name == "nt":
+        try:
             process.terminate()
-        else:
-            os.killpg(process.pid, signal.SIGTERM)
-    except (OSError, ProcessLookupError):
-        process.terminate()
-    try:
-        process.wait(timeout=5)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        if os.name == "nt":
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
             process.kill()
-        else:
-            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+        return
+
+    descendants = descendant_process_ids(process.pid)
+    signal_processes(descendants, signal.SIGTERM)
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
     except (OSError, ProcessLookupError):
-        process.kill()
+        pass
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        root_running = process.poll() is None
+        descendants_running = any(process_is_active(pid) for pid in descendants)
+        if not root_running and not descendants_running:
+            return
+        time.sleep(0.05)
+
+    signal_processes(descendants, signal.SIGKILL)
+    if process.poll() is None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            process.kill()
     process.wait(timeout=5)
+
+
+def describe_process_exit(exit_code: int) -> str:
+    """Describe a subprocess exit without treating a signal as a normal status."""
+    if exit_code >= 0:
+        return f"opencode run exited with status {exit_code}"
+    signal_number = -exit_code
+    try:
+        detail = f"{signal.Signals(signal_number).name} ({signal_number})"
+    except ValueError:
+        detail = str(signal_number)
+    return f"opencode run terminated by signal {detail}"
 
 
 def run_opencode_once(config: BridgeConfig, prompt: str, session_id: str) -> tuple[str, str]:
@@ -604,17 +706,17 @@ def run_opencode_once(config: BridgeConfig, prompt: str, session_id: str) -> tup
     try:
         while True:
             now = time.monotonic()
-            if now - started_at >= config.run_timeout_seconds:
+            if config.run_timeout_seconds > 0 and now - started_at >= config.run_timeout_seconds:
                 terminate_process(process)
-                raise RuntimeError("opencode run exceeded configured timeout")
-            if now - last_output_at >= config.idle_timeout_seconds:
+                raise OpenCodeRunTimeoutError("opencode run exceeded configured timeout")
+            if config.idle_timeout_seconds > 0 and now - last_output_at >= config.idle_timeout_seconds:
                 terminate_process(process)
-                raise RuntimeError("opencode run exceeded configured idle timeout")
-            wait_for = min(
-                1.0,
-                config.run_timeout_seconds - (now - started_at),
-                config.idle_timeout_seconds - (now - last_output_at),
-            )
+                raise OpenCodeIdleTimeoutError("opencode run exceeded configured idle timeout")
+            wait_for = 1.0
+            if config.run_timeout_seconds > 0:
+                wait_for = min(wait_for, config.run_timeout_seconds - (now - started_at))
+            if config.idle_timeout_seconds > 0:
+                wait_for = min(wait_for, config.idle_timeout_seconds - (now - last_output_at))
             try:
                 chunk = output_queue.get(timeout=max(0.05, wait_for))
             except queue.Empty:
@@ -660,7 +762,7 @@ def run_opencode_once(config: BridgeConfig, prompt: str, session_id: str) -> tup
     exit_code = process.wait()
     final_text = "\n\n".join(dedupe_preserve_order(blocks)).strip()
     if exit_code != 0:
-        raise RuntimeError(f"opencode run exited with status {exit_code}")
+        raise RuntimeError(describe_process_exit(exit_code))
     return final_text, seen_session
 
 
@@ -736,6 +838,8 @@ def run_bridge() -> int:
         emit_final_output(final_text)
     except Exception as exc:
         log(f"Final: opencode bridge failed: {sanitize_log_text(str(exc), config)}")
+        if isinstance(exc, OpenCodeTimeoutError):
+            return exc.exit_code
         return 1
     log("Final: opencode bridge completed")
     return 0

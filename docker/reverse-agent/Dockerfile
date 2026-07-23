@@ -41,6 +41,7 @@ RUN apt-get -o Acquire::Retries=5 update \
         qemu-utils \
         tesseract-ocr \
         traceroute \
+        unar \
         unzip \
         upx-ucl \
         wine \
