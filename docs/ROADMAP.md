@@ -2,7 +2,7 @@
 
 本文件是任务状态的唯一来源。状态使用`done`、`in_progress`、`blocked`、`planned`。证据必须是可重复命令、测试名称、工作流或文档路径；提交列在尚未提交时写`working-tree`。
 
-最后更新时间:2026-07-20
+最后更新时间:2026-10-05
 
 |ID|状态|完成证据|关联提交|最后更新|
 |---|---|---|---|---|
@@ -33,9 +33,11 @@
 |---|---|---|
 |确定性检查|done|`./scripts/check-all.ps1 -Vulnerability`，可达漏洞0项|
 |Linux竞态与双Go版本|done|Go1.25.12/1.26.5容器测试；Go1.26`-race`通过|
-|假Provider实际任务|done|misc镜像任务解出`flag{ctf_agent_smoke_ok}`并生成WP|
+|假Provider实际任务|blocked|PR #9的[Docker检查](https://github.com/dlongx/CTF_Agent/actions/runs/29988751576)失败：等待300秒后任务仍为running，日志停在OpenCode启动阶段；根因未确认|
 |本地依赖就绪|done|`/ready`共10项检查全部通过|
 |真实Provider烟测|blocked|2026-07-13显式`/models`检查20秒超时；发布前必须恢复且完成真实任务烟测|
+
+2026-10-05落地记录：新增项目级`.agents/skills/land/SKILL.md`；本地`./scripts/check-all.ps1`通过，Go覆盖率71.1%、Python桥接核心覆盖率83.0%，17项Python测试及820个本地Markdown链接检查通过。操作者明确接受PR #9假Provider烟测失败风险，授权本次整条分支直接推送到`main`；该例外不表示烟测恢复或发布门禁通过，也不修改今后的常规落地要求。
 
 ## 长期治理
 
