@@ -18,7 +18,7 @@ metadata:
 - 阅读当前AGENTS.md、CONTRIBUTING.md、README.md、docs/ARCHITECTURE.md、docs/DEVELOPMENT.md，以及变更路径适用的嵌套指令。
 - 使用`git --no-optional-locks status --short`、`git branch -avv`、`git remote -v`和分支差异确认工作区、提交范围与目标。保留无关的已暂存和未暂存修改，不自动stash、清理或覆盖用户文件；范围不明时先询问。
 - 本流程只适用于CTF_Agent。核实origin仍指向用户预期的GitHub仓库，默认目标为origin/main；local是本机回链，不用于发布。目标改变时停止核实，不猜测。
-- 检查Git、GitHub CLI、PowerShell7、Go、Python、Node和按需使用的Docker；运行时版本以go.mod及.github/workflows/ci.yml为准。调查时环境为Go1.26.5、Python3.12、Node24、PowerShell7，不能把这些已安装状态当作永久保证。
+- 检查Git、GitHub CLI、PowerShell7、Go、Python、Node和按需使用的Docker；运行时版本以go.mod及.github/workflows/ci.yml为准。本次更新已验证Go1.26.6，当前CI竞态与漏洞扫描固定使用该版本；项目最低Go版本仍为1.25.0。调查时本机默认Go1.26.5、Python3.12、Node24、PowerShell7，不能把已安装状态当作永久保证，也不能用默认旧工具链冒充已验证版本。
 - 通过GitHub CLI确认认证可用，避免输出令牌或完整环境。读取当前目标分支保护、rulesets、仓库合并设置和PR审核状态；API无法验证要求时停止，不把权限错误视为没有规则。
 
 ## 2. 准备可审查的变更
