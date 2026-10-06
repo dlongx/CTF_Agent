@@ -10,6 +10,7 @@
 - 假Provider端到端烟测、GitHub Actions、备份恢复和Markdown链接检查。
 - 元数据版本、备份恢复、日志轮转、容器保留清理和结构化运行日志。
 - OpenCode原生Skill目录及原生前端ES Modules。
+- 项目级`land`技能，定义变更验证、冲突处理及落地结果核验流程。
 
 ### Changed
 
